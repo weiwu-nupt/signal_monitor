@@ -136,6 +136,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.source.set_error_callback(self._on_source_error)
         self.source.start()
 
+        from receiver.integrate import attach_receiver_pages
+        attach_receiver_pages(self)   # self 是 QMainWindow
+
     def _build_ui(self) -> None:
         central = QtWidgets.QWidget()
         self.setCentralWidget(central)
