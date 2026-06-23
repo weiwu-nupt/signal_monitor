@@ -6,6 +6,8 @@ FPGA 频谱分析器 主窗口
 """
 
 from __future__ import annotations
+from dma_source import DMASpectrumSource
+
 
 import sys
 import time
@@ -41,7 +43,6 @@ class SpectrumView(pg.PlotWidget):
         self.setLabel("bottom", "Frequency", units="Hz")
         self.setLabel("left", "Power", units="dB")
         self.showGrid(x=True, y=True, alpha=0.25)
-        self.setYRange(-110, -10)
 
         self.setDownsampling(auto=True, mode="peak")
         self.setClipToView(True)
@@ -131,7 +132,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._poll_timer = QtCore.QTimer(self)
         self._poll_timer.timeout.connect(self._poll_messages)
-        self._poll_timer.start(100)
+        self._poll_timer.start(33)
 
         self.source.set_error_callback(self._on_source_error)
         self.source.start()
@@ -308,10 +309,15 @@ class MainWindow(QtWidgets.QMainWindow):
         freq = msg.freq_axis_hz
         spec = msg.spectrum_db
 
+        lo = float(spec.min()) - 5
+        hi = float(spec.max()) + 10
+        self.spectrum_view.setYRange(lo, hi)
+
         # 频谱图
         self.spectrum_view.update_spectrum(freq, spec)
 
         # 瀑布图
+        self.waterfall_view.set_levels(lo, hi)
         self.waterfall_view.set_freq_range(
             float(freq[0]), float(freq[-1])
         )
@@ -373,8 +379,7 @@ class MainWindow(QtWidgets.QMainWindow):
 def main():
     import argparse
     parser = argparse.ArgumentParser(description="FPGA Spectrum Analyzer")
-    parser.add_argument("--mode", choices=["sim", "pcie"], default="sim",
-                        help="sim=仿真; pcie=真实硬件")
+    parser.add_argument("--mode", choices=["sim", "pcie", "dma"], default="dma")
     parser.add_argument("--device", default="/dev/xdma0_c2h_0",
                         help="PCIe 字符设备路径")
     parser.add_argument("--fft", type=int, default=65535,
@@ -394,6 +399,13 @@ def main():
             center_mhz=args.center,
             bandwidth_mhz=args.bw,
             frame_rate_hz=args.rate,
+        )
+    elif args.mode == "dma":
+        # 真实硬件: slot 轮询 + 定长读 + 写 ACK
+        h2c = args.device.replace("c2h", "h2c")   # /dev/xdma0_c2h_0 -> _h2c_0
+        source = DMASpectrumSource(
+            c2h_dev=args.device,
+            h2c_dev=h2c,
         )
     else:
         source = create_source(
