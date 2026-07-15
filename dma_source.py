@@ -1,111 +1,134 @@
-"""
-DMA 频谱数据源
-================
-基于 spectrum_reader.py 的 slot/ACK 协议, 通过 XDMA 字符设备
-(/dev/xdma0_c2h_0 读, /dev/xdma0_h2c_0 写 ACK) 接收 8192 点频谱包,
-在后台线程里持续轮询, 输出与 GUI 兼容的 SpectrumMessage.
+"""XDMA C2H spectrum source for the replay-spectrum FPGA design.
 
-与 data_source.py 中 PCIeSource 的区别:
-  - PCIeSource 是"流式字节流 + ProtocolParser"模型 (int16 样点)
-  - 本模块是"寄存器 status 轮询 + 绝对地址定长读 + 写 ACK"模型 (uint64 power)
-本模块直接复用 spectrum_reader.py 里已验证过的 read_one_spectrum() 逻辑.
+The FPGA sends one contiguous packet on ``/dev/xdma0_c2h_0``:
 
-用法 (独立):
-    src = DMASpectrumSource()
-    src.start()
-    msg = src.get_message(timeout=1.0)
-    src.stop()
+* 64-byte header;
+* 8192 little-endian ``uint64`` FFT-power values;
+* 64-byte tail.
 
-用法 (接入现有 main.py):
-    在 create_source / 命令行里增加 mode="dma" 即可, 见文件末尾说明.
+This is the protocol used by ``xdma_replay_spectrum(1).py``.  Unlike the
+older ``spectrum_reader.py`` design, it does not use status-slot polling or
+an H2C ACK packet.
 """
 
 from __future__ import annotations
 
 import os
-import time
+import struct
 import threading
 from dataclasses import dataclass
-from queue import Queue, Full, Empty
-from typing import Optional, Callable
+from queue import Empty, Full, Queue
+from typing import Callable, Optional
 
 import numpy as np
-
-# 复用 spectrum_reader.py 里已验证的底层协议实现
-import spectrum_reader as sr
-
 from protocol import SpectrumMessage
 
 
-# ============================================================
-# GUI 兼容的频谱消息
-# ============================================================
-# spectrum_reader 产出的是已经算好的 power_db (float64, 已 10*log10).
-# 现有 protocol.SpectrumMessage 的 spectrum_db 属性是 samples * 0.1,
-# 为了不改 main.py / waterfall.py, 这里做一个适配子类:
-# 把 power_db 直接存进去, 覆写 spectrum_db 属性原样返回.
+NFFT = 8192
+C2H_HEADER_BYTES = 64
+C2H_PAYLOAD_BYTES = NFFT * 8
+C2H_TAIL_BYTES = 64
+C2H_PACKET_BYTES = C2H_HEADER_BYTES + C2H_PAYLOAD_BYTES + C2H_TAIL_BYTES
+
+DEFAULT_C2H_DEV = "/dev/xdma0_c2h_0"
+DEFAULT_SYNC_WORD = 0x1ACFFC1D
+
 
 @dataclass
 class DMASpectrumMessage(SpectrumMessage):
-    """spectrum_reader 的 power_db 适配为 GUI 用的 SpectrumMessage"""
+    """A GUI message whose samples are already represented in dB."""
 
     _power_db: Optional[np.ndarray] = None
 
     @property
     def spectrum_db(self) -> np.ndarray:  # type: ignore[override]
-        # power_db 已是 dB, 直接返回 float32
         if self._power_db is not None:
             return self._power_db
         return self.samples.astype(np.float32) * 0.1
 
 
-# ============================================================
-# DMA 频谱数据源
-# ============================================================
+def parse_c2h_packet(packet: bytes, *, sync_word: int = DEFAULT_SYNC_WORD) -> tuple[dict[str, int], np.ndarray]:
+    """Validate and unpack a replay-spectrum C2H packet."""
+    if len(packet) != C2H_PACKET_BYTES:
+        raise RuntimeError(
+            f"C2H packet length is {len(packet)}, expected {C2H_PACKET_BYTES}"
+        )
+
+    header = {
+        "sync": struct.unpack_from("<I", packet, 0)[0],
+        "msg_type": packet[4],
+        "msg_len": struct.unpack_from("<I", packet, 5)[0],
+        "center_mhz": struct.unpack_from("<H", packet, 9)[0],
+        "bandwidth_mhz": struct.unpack_from("<H", packet, 11)[0],
+        "fft_points": struct.unpack_from("<H", packet, 13)[0],
+        "source": packet[15],
+        "sequence": struct.unpack_from("<I", packet, 16)[0],
+        "frame_id": struct.unpack_from("<I", packet, 20)[0],
+    }
+    if header["sync"] != sync_word:
+        raise RuntimeError(
+            f"unexpected C2H sync word 0x{header['sync']:08X}, "
+            f"expected 0x{sync_word:08X}"
+        )
+    if header["fft_points"] != NFFT:
+        raise RuntimeError(
+            f"unexpected FFT size {header['fft_points']}, expected {NFFT}"
+        )
+
+    power = np.frombuffer(
+        packet, dtype="<u8", count=NFFT, offset=C2H_HEADER_BYTES
+    ).copy()
+    return header, power
+
 
 class DMASpectrumSource:
-    """
-    后台线程持续调用 spectrum_reader.read_one_spectrum(),
-    把每一帧封装成 DMASpectrumMessage 推进队列, 主线程 get_message 取.
+    """Read FPGA replay-spectrum packets in a background thread for the GUI.
 
-    心跳节流: 没有新包时 sleep(interval), 不空转占满 CPU.
-    错误处理: 单帧解析/校验失败默认丢弃并记 bad 计数, 不中断线程;
-              设备级错误 (打开失败/读空) 通过 error_callback 抛给 GUI.
+    ``h2c_dev`` and ``poll_interval`` remain accepted for compatibility with
+    the previous source API.  The current FPGA protocol neither opens H2C nor
+    polls a status register; C2H reads block until a complete packet arrives.
     """
 
-    def __init__(self,
-                 c2h_dev: str = sr.C2H_DEV,
-                 h2c_dev: str = sr.H2C_DEV,
-                 sync_words=sr.DEFAULT_ALLOWED_SYNC_WORDS,
-                 poll_interval: float = 0.02,
-                 raise_on_bad_packet: bool = False,
-                 queue_size: int = 16):
+    def __init__(
+        self,
+        c2h_dev: str = DEFAULT_C2H_DEV,
+        h2c_dev: Optional[str] = None,
+        sync_words: object = None,
+        poll_interval: float = 0.02,
+        raise_on_bad_packet: bool = False,
+        queue_size: int = 16,
+        floor_db: float = -120.0,
+    ) -> None:
         self.c2h_dev = c2h_dev
-        self.h2c_dev = h2c_dev
-        self.sync_words = tuple(sync_words)
+        self.h2c_dev = h2c_dev  # Retained for callers of the former API.
         self.poll_interval = poll_interval
         self.raise_on_bad_packet = raise_on_bad_packet
+        self.floor_db = floor_db
 
-        self._queue: "Queue[DMASpectrumMessage]" = Queue(maxsize=queue_size)
+        # The new protocol has one fixed sync word.  Accept a legacy iterable
+        # only when it contains that word, so old call sites keep working.
+        if sync_words is not None and DEFAULT_SYNC_WORD not in tuple(sync_words):
+            raise ValueError(
+                f"sync_words must include 0x{DEFAULT_SYNC_WORD:08X} for this FPGA design"
+            )
+
+        self._queue: Queue[DMASpectrumMessage] = Queue(maxsize=queue_size)
         self._running = False
         self._thread: Optional[threading.Thread] = None
         self._error_callback: Optional[Callable[[Exception], None]] = None
-
         self._c2h_fd = -1
-        self._h2c_fd = -1
-
+        self._fd_lock = threading.Lock()
         self._stats = {
             "spectrum_ok": 0,
-            "signal_ok": 0,      # 该协议无信号消息, 恒为 0 (GUI 统计兼容)
-            "bad_crc": 0,
+            "signal_ok": 0,
+            "bad_crc": 0,       # No CRC is defined by the new C2H reader.
             "bad_packet": 0,
             "empty_poll": 0,
             "drops": 0,
-            "bytes_dropped": 0,  # GUI 统计兼容字段
+            "bytes_dropped": 0,
             "last_seq": -1,
+            "last_frame_id": -1,
         }
-
-    # ---- 与 DataSource 接口保持一致 ----
 
     def set_error_callback(self, cb: Callable[[Exception], None]) -> None:
         self._error_callback = cb
@@ -115,19 +138,20 @@ class DMASpectrumSource:
             return
         self._running = True
         self._thread = threading.Thread(
-            target=self._run_loop, name="DMASpectrumRx", daemon=True)
+            target=self._run_loop, name="DMASpectrumRx", daemon=True
+        )
         self._thread.start()
 
     def stop(self) -> None:
         self._running = False
+        self._close_device()
         if self._thread is not None:
             self._thread.join(timeout=2.0)
             self._thread = None
 
     def get_message(self, timeout: float = 0.0) -> Optional[DMASpectrumMessage]:
         try:
-            return (self._queue.get(timeout=timeout) if timeout > 0
-                    else self._queue.get_nowait())
+            return self._queue.get(timeout=timeout) if timeout > 0 else self._queue.get_nowait()
         except Empty:
             return None
 
@@ -137,150 +161,98 @@ class DMASpectrumSource:
     def get_stats(self) -> dict:
         return dict(self._stats)
 
-    # ---- 内部 ----
-
-    def _push_message(self, msg: DMASpectrumMessage) -> None:
+    def _open_device(self) -> None:
+        if not os.path.exists(self.c2h_dev):
+            raise FileNotFoundError(
+                f"XDMA C2H device {self.c2h_dev} does not exist; "
+                "check the XDMA driver and /dev/xdma* nodes"
+            )
         try:
-            self._queue.put_nowait(msg)
+            fd = os.open(self.c2h_dev, os.O_RDONLY | os.O_SYNC)
+        except PermissionError as exc:
+            raise PermissionError(
+                f"permission denied opening {self.c2h_dev}; run with sufficient XDMA device permissions"
+            ) from exc
+        with self._fd_lock:
+            self._c2h_fd = fd
+
+    def _close_device(self) -> None:
+        with self._fd_lock:
+            fd, self._c2h_fd = self._c2h_fd, -1
+        if fd >= 0:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+    def _read_packet(self) -> bytes:
+        """Accumulate exactly one packet; XDMA reads may be shorter than requested."""
+        chunks: list[bytes] = []
+        remaining = C2H_PACKET_BYTES
+        while remaining:
+            with self._fd_lock:
+                fd = self._c2h_fd
+            if fd < 0:
+                raise RuntimeError("C2H device was closed")
+            data = os.read(fd, remaining)
+            if not data:
+                raise RuntimeError("C2H returned EOF while reading a spectrum packet")
+            chunks.append(data)
+            remaining -= len(data)
+        return b"".join(chunks)
+
+    def _push_message(self, message: DMASpectrumMessage) -> None:
+        try:
+            self._queue.put_nowait(message)
         except Full:
-            # 队列满: 丢最旧的一帧, 保留最新
             try:
                 self._queue.get_nowait()
                 self._stats["drops"] += 1
             except Empty:
                 pass
             try:
-                self._queue.put_nowait(msg)
+                self._queue.put_nowait(message)
             except Full:
                 pass
 
-    def _open_devices(self) -> None:
-        if not os.path.exists(self.c2h_dev):
-            raise FileNotFoundError(
-                f"XDMA 读设备 {self.c2h_dev} 不存在. 请检查:\n"
-                f"  lsmod | grep xdma   (驱动)\n"
-                f"  ls /dev/xdma*       (设备节点)"
-            )
-        if not os.path.exists(self.h2c_dev):
-            raise FileNotFoundError(
-                f"XDMA 写设备 {self.h2c_dev} 不存在 (写 ACK 需要)."
-            )
-        try:
-            self._c2h_fd = os.open(self.c2h_dev, os.O_RDONLY | os.O_SYNC)
-            self._h2c_fd = os.open(self.h2c_dev, os.O_WRONLY | os.O_SYNC)
-        except PermissionError as e:
-            raise PermissionError(
-                f"打开 XDMA 设备权限不足, 请 sudo 运行, 或加 udev 规则:\n"
-                f'  echo \'SUBSYSTEM=="xdma", MODE="0666"\' | '
-                f'sudo tee /etc/udev/rules.d/60-xdma.rules\n'
-                f"  sudo udevadm control --reload && sudo udevadm trigger"
-            ) from e
-
-    def _close_devices(self) -> None:
-        for fd_name in ("_c2h_fd", "_h2c_fd"):
-            fd = getattr(self, fd_name)
-            if fd >= 0:
-                try:
-                    os.close(fd)
-                except OSError:
-                    pass
-                setattr(self, fd_name, -1)
-
     def _run_loop(self) -> None:
         try:
-            self._open_devices()
-            self._loop_impl()
-        except Exception as e:
-            if self._error_callback:
-                self._error_callback(e)
-            else:
-                raise
+            self._open_device()
+            while self._running:
+                try:
+                    header, power = parse_c2h_packet(self._read_packet())
+                except RuntimeError:
+                    if not self._running:
+                        break
+                    self._stats["bad_packet"] += 1
+                    if self.raise_on_bad_packet:
+                        raise
+                    continue
+                self._push_message(self._build_message(header, power))
+                self._stats["spectrum_ok"] += 1
+                self._stats["last_seq"] = header["sequence"]
+                self._stats["last_frame_id"] = header["frame_id"]
+        except Exception as exc:
+            if self._running and self._error_callback is not None:
+                self._error_callback(exc)
         finally:
-            self._close_devices()
+            self._close_device()
 
-    def _loop_impl(self) -> None:
-        while self._running:
-            try:
-                result = sr.read_one_spectrum(
-                    self._c2h_fd, self._h2c_fd, self.sync_words)
-            except RuntimeError as e:
-                # 单帧级错误: status magic 错 / 校验失败等
-                self._stats["bad_packet"] += 1
-                # 校验失败的细分: CRC
-                if "crc" in str(e).lower():
-                    self._stats["bad_crc"] += 1
-                if self.raise_on_bad_packet:
-                    raise
-                time.sleep(self.poll_interval)
-                continue
-
-            if result is None:
-                # 当前没有新 packet
-                self._stats["empty_poll"] += 1
-                time.sleep(self.poll_interval)
-                continue
-
-            msg = self._build_message(result)
-            self._push_message(msg)
-
-            self._stats["spectrum_ok"] += 1
-            self._stats["last_seq"] = result["seq"]
-
-    def _build_message(self, result: dict) -> DMASpectrumMessage:
-        pkt = result["packet"]
-        power_db = np.ascontiguousarray(result["power_db"], dtype=np.float32)
-
-        # 单位: header 里 center/bw 字段单位是 MHz
-        center_hz = float(pkt["center"]) * 1e6
-        bw_hz = float(pkt["bw"]) * 1e6
-        fft_n = int(pkt["fft_n"])
-
+    def _build_message(self, header: dict[str, int], power: np.ndarray) -> DMASpectrumMessage:
+        # Match xdma_replay_spectrum: display power normalized to the packet peak.
+        power_float = power.astype(np.float64)
+        peak = max(float(np.max(power_float)), np.finfo(np.float64).tiny)
+        power_db = 10.0 * np.log10(np.maximum(power_float, np.finfo(np.float64).tiny) / peak)
+        power_db = np.maximum(power_db, self.floor_db).astype(np.float32)
         return DMASpectrumMessage(
-            center_freq_hz=center_hz,
-            bandwidth_hz=bw_hz,
-            fft_points=fft_n,
-            samples=power_db,          # 占位 (spectrum_db 已覆写)
-            crc_ok=pkt["checks"]["crc_ok"],
+            center_freq_hz=header["center_mhz"] * 1e6,
+            bandwidth_hz=header["bandwidth_mhz"] * 1e6,
+            fft_points=header["fft_points"],
+            samples=power_db,
+            crc_ok=True,
             _power_db=power_db,
         )
 
 
-# ============================================================
-# 工厂辅助: 接入 main.py 用
-# ============================================================
-
-def create_dma_source(**kwargs) -> DMASpectrumSource:
+def create_dma_source(**kwargs: object) -> DMASpectrumSource:
     return DMASpectrumSource(**kwargs)
-
-
-if __name__ == "__main__":
-    # 无硬件时这里会因设备不存在而走 error_callback / 抛异常,
-    # 真实环境 sudo 运行可直接看到帧.
-    import argparse
-
-    ap = argparse.ArgumentParser(description="DMA 频谱源独立测试")
-    ap.add_argument("--frames", type=int, default=5)
-    ap.add_argument("--interval", type=float, default=0.02)
-    args = ap.parse_args()
-
-    src = DMASpectrumSource(poll_interval=args.interval)
-
-    def on_err(e):
-        print(f"[ERROR] {type(e).__name__}: {e}")
-
-    src.set_error_callback(on_err)
-    src.start()
-
-    got = 0
-    t0 = time.time()
-    while got < args.frames and time.time() - t0 < 10:
-        msg = src.get_message(timeout=1.0)
-        if msg is None:
-            continue
-        got += 1
-        sdb = msg.spectrum_db
-        print(f"frame {got}: center={msg.center_freq_hz/1e6:.0f}MHz "
-              f"bw={msg.bandwidth_hz/1e6:.0f}MHz pts={msg.fft_points} "
-              f"peak={sdb.max():.1f}dB crc_ok={msg.crc_ok}")
-    src.stop()
-    print("stats:", src.get_stats())

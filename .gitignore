@@ -1,0 +1,19 @@
+# Python 缓存 全局所有目录都忽略
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.pyx
+
+# VSCode
+.vscode/
+*.code-workspace
+
+# 临时、日志
+*.log
+tmp/
+temp/
+
+# 系统垃圾
+Thumbs.db
+.DS_Store
