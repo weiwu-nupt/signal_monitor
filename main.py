@@ -401,11 +401,9 @@ def main():
             frame_rate_hz=args.rate,
         )
     elif args.mode == "dma":
-        # 真实硬件: slot 轮询 + 定长读 + 写 ACK
-        h2c = args.device.replace("c2h", "h2c")   # /dev/xdma0_c2h_0 -> _h2c_0
+        # 真实硬件: 从 C2H 连续读取 8192 点频谱包。
         source = DMASpectrumSource(
             c2h_dev=args.device,
-            h2c_dev=h2c,
         )
     else:
         source = create_source(
