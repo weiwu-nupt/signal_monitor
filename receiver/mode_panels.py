@@ -21,6 +21,12 @@ from .controller import (
 DEMOD_MODES = ["IQ", "AM", "FM", "CW", "LSB", "USB", "PULSE", "PM", "DMR", "DPMR"]
 RF_MODES = ["NORMal", "LOWNoise", "LOWDistort"]
 DETECTORS = ["FAST", "POSitive", "AVERage", "RMS"]
+FFM_SPANS_KHZ = {
+    "1 MHz": 1000.0, "2 MHz": 2000.0, "5 MHz": 5000.0,
+    "10 MHz": 10000.0, "20 MHz": 20000.0, "40 MHz": 40000.0,
+}
+FFM_STEPS_KHZ = ["6.25", "12.5", "25", "50", "100", "200"]
+FFM_BANDWIDTHS_KHZ = ["6.25", "12.5", "25", "50", "100", "200", "500"]
 
 
 def _dspin(lo, hi, val, step=1.0, suffix="", decimals=3):
@@ -31,6 +37,8 @@ def _dspin(lo, hi, val, step=1.0, suffix="", decimals=3):
     s.setDecimals(decimals)
     if suffix:
         s.setSuffix(suffix)
+    s.setMinimumWidth(176)
+    s.setMinimumHeight(28)
     return s
 
 
@@ -41,7 +49,23 @@ def _ispin(lo, hi, val, step=1, suffix=""):
     s.setSingleStep(step)
     if suffix:
         s.setSuffix(suffix)
+    s.setMinimumWidth(176)
+    s.setMinimumHeight(28)
     return s
+
+
+def _on_off_combo(default: bool = False) -> QtWidgets.QComboBox:
+    """创建统一的 ON/OFF 开关下拉框。"""
+    combo = QtWidgets.QComboBox()
+    combo.addItems(["ON", "OFF"])
+    combo.setCurrentText("ON" if default else "OFF")
+    combo.setMinimumWidth(176)
+    combo.setMinimumHeight(28)
+    return combo
+
+
+def _is_on(combo: QtWidgets.QComboBox) -> bool:
+    return combo.currentText() == "ON"
 
 
 # ============================================================
@@ -54,38 +78,85 @@ class FFMPanel(QtWidgets.QWidget):
         f = QtWidgets.QFormLayout(self)
         f.setLabelAlignment(QtCore.Qt.AlignmentFlag.AlignRight)
 
-        self.center = _dspin(20, 8000, 101.7, 0.1, " MHz")
-        self.span = _dspin(1, 40000, 1000, 100, " kHz", 1)
-        self.bw = _dspin(1, 500, 120, 1, " kHz", 1)
-        self.ref = _dspin(-256, 256, 80, 5, " dBµV", 0)
-        self.lvspan = _dspin(1, 50, 10, 5, " dB/格", 0)
+        # 控件原始上限为 300000 MHz；按本项目接收机能力限制为 8000 MHz。
+        self.center = _dspin(0, 8000, 2000, 0.1, " MHz", 6)
+        self.span = QtWidgets.QComboBox(); self.span.addItems(FFM_SPANS_KHZ)
+        self.span.setCurrentText("20 MHz")
+        self.step = QtWidgets.QComboBox(); self.step.addItems(FFM_STEPS_KHZ)
+        self.step.setCurrentText("6.25")
+        self.offset = _dspin(-40000, 40000, 0, 12.5, " kHz", 3)
+        self.ref_clock = QtWidgets.QComboBox(); self.ref_clock.addItems(["0", "10 MHz", "外部"])
+        self.bw = QtWidgets.QComboBox(); self.bw.addItems(FFM_BANDWIDTHS_KHZ)
+        self.bw.setCurrentText("500")
+        self.ref = _dspin(-256, 256, 120, 5, " dBµV", 0)
+        self.lvspan = _dspin(1, 50, 20, 1, " dB/格", 0)
+        self.xdb_band = _dspin(0, 200, 26, 1, " dB", 0)
+        self.beta_band = _dspin(0, 100, 0, 0.01, " %", 2)
         self.demod = QtWidgets.QComboBox(); self.demod.addItems(DEMOD_MODES)
         self.demod.setCurrentText("FM")
         self.detector = QtWidgets.QComboBox(); self.detector.addItems(DETECTORS)
-        self.sql = QtWidgets.QCheckBox("静噪 SQL")
-        self.thr = _dspin(-30, 130, 10, 5, " dBµV", 0)
-        self.attauto = QtWidgets.QCheckBox("自动衰减 (AGC)")
-        self.attauto.setChecked(True)
+        self.detector.setCurrentText("POSitive")
+        self.sql = _on_off_combo()
+        self.thr = _dspin(-256, 256, 50, 5, " dBµV", 0)
+        self.level_trigger = _on_off_combo()
+        self.trigger_level = _dspin(-256, 256, 0, 1, " dBµV", 0)
+        self.attauto = _on_off_combo()
         self.ifatt = _dspin(0, 50, 0, 2, " dB", 0)
         self.rfatt = _dspin(0, 50, 0, 2, " dB", 0)
         self.rfmode = QtWidgets.QComboBox(); self.rfmode.addItems(RF_MODES)
+        self.rfmode2 = QtWidgets.QComboBox(); self.rfmode2.addItems(RF_MODES)
+        self.rf_output = QtWidgets.QComboBox(); self.rf_output.addItems(["低速", "高速"])
+        self.high_performance = _on_off_combo()
+        self.meas_time = QtWidgets.QComboBox(); self.meas_time.addItems(["100 µs", "500 µs", "1 ms", "5 ms", "10 ms"])
+        self.meas_time.setCurrentText("500 µs")
+        self.dpx_refresh = _ispin(20, 5000, 100, 10, " ms")
+        self.echo_speed = _ispin(1, 100, 1, 1)
+        self.red_occupancy = _dspin(0, 100, 1, 0.01, " %", 2)
+
+        for combo in (self.span, self.step, self.ref_clock, self.bw,
+                      self.demod, self.detector, self.rfmode, self.rfmode2,
+                      self.rf_output, self.meas_time):
+            combo.setMinimumWidth(176)
+            combo.setMinimumHeight(28)
 
         f.addRow("中心频率", self.center)
         f.addRow("频谱跨距", self.span)
-        f.addRow("中频带宽", self.bw)
+        f.addRow("频谱步进", self.step)
+        f.addRow("频率偏移", self.offset)
+        f.addRow("参考时钟", self.ref_clock)
         f.addRow("参考电平", self.ref)
         f.addRow("电平跨度", self.lvspan)
+        f.addRow("Xdb 带宽", self.xdb_band)
+        f.addRow("β% 带宽", self.beta_band)
         f.addRow("解调模式", self.demod)
-        f.addRow("检波方式", self.detector)
-        f.addRow("", self.sql)
+        f.addRow("静噪 SQL", self.sql)
         f.addRow("静噪门限", self.thr)
-        f.addRow("", self.attauto)
-        f.addRow("中频衰减", self.ifatt)
+        f.addRow("电平触发", self.level_trigger)
+        f.addRow("触发电平", self.trigger_level)
+        f.addRow("解调带宽", self.bw)
         f.addRow("射频衰减", self.rfatt)
-        f.addRow("射频模式", self.rfmode)
+        f.addRow("中频衰减", self.ifatt)
+        f.addRow("射频模式 1", self.rfmode)
+        f.addRow("射频模式 2", self.rfmode2)
+        f.addRow("射频输出模式", self.rf_output)
+        f.addRow("AGC", self.attauto)
+        f.addRow("高性能模式", self.high_performance)
+        f.addRow("测量时间", self.meas_time)
+        f.addRow("检波方式", self.detector)
+        f.addRow("DPX 刷新时间", self.dpx_refresh)
+        f.addRow("回波速度", self.echo_speed)
+        f.addRow("红色占有率", self.red_occupancy)
 
-        self.attauto.toggled.connect(self._toggle_att)
-        self._toggle_att(True)
+        self.attauto.currentTextChanged.connect(self._on_att_auto_changed)
+        self._toggle_att(False)
+        self.level_trigger.currentTextChanged.connect(self._on_level_trigger_changed)
+        self.trigger_level.setEnabled(False)
+
+    def _on_att_auto_changed(self, value: str):
+        self._toggle_att(value == "ON")
+
+    def _on_level_trigger_changed(self, value: str):
+        self.trigger_level.setEnabled(value == "ON")
 
     def _toggle_att(self, auto):
         self.ifatt.setEnabled(not auto)
@@ -94,18 +165,33 @@ class FFMPanel(QtWidgets.QWidget):
     def get_config(self) -> FFMConfig:
         return FFMConfig(
             center_mhz=self.center.value(),
-            span_khz=self.span.value(),
-            bandwidth_khz=self.bw.value(),
+            span_khz=FFM_SPANS_KHZ[self.span.currentText()],
+            step_khz=float(self.step.currentText()),
+            offset_khz=self.offset.value(),
+            bandwidth_khz=float(self.bw.currentText()),
+            ref_clock=self.ref_clock.currentText(),
             ref_level_dbuv=self.ref.value(),
             level_span_db=self.lvspan.value(),
+            xdb_band_db=self.xdb_band.value(),
+            beta_band_pct=self.beta_band.value(),
             demod=self.demod.currentText(),
-            squelch_on=self.sql.isChecked(),
+            squelch_on=_is_on(self.sql),
             threshold_dbuv=self.thr.value(),
-            att_auto=self.attauto.isChecked(),
+            level_trigger_on=_is_on(self.level_trigger),
+            level_trigger_dbuv=self.trigger_level.value(),
+            att_auto=_is_on(self.attauto),
             if_att_db=self.ifatt.value(),
             rf_att_db=self.rfatt.value(),
             rf_mode=self.rfmode.currentText(),
+            rf_mode_2=self.rfmode2.currentText(),
+            rf_output_mode=self.rf_output.currentText(),
+            high_performance=_is_on(self.high_performance),
+            measure_time_us={"100 µs": 100, "500 µs": 500, "1 ms": 1000,
+                             "5 ms": 5000, "10 ms": 10000}[self.meas_time.currentText()],
             detector=self.detector.currentText(),
+            dpx_refresh_ms=self.dpx_refresh.value(),
+            echo_speed=self.echo_speed.value(),
+            red_occupancy_pct=self.red_occupancy.value(),
         )
 
 

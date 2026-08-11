@@ -9,7 +9,8 @@
             audioReady / ddcReady / statusMessage / errorOccurred
 
 5 种模式与端口/命令的对应 (依据配置文档 + SCPI 手册):
-    FFM   : MODE FIXed ; UDP 8000(MEAS) 8001(AUD) 8004(IF) ; MED LEVel,SPECtrum,ITU
+    FFM   : MODE FIXed ; UDP 8000(MEAS) 8004(IF) ; MED SPECtrum
+            （IQ 数据由 IF 通道输出）
     PSCAN : MODE PSCan ; PSCan:MODE NORMal ; UDP 8002(SCAN) ; MED SCAN
     FPSCAN: MODE PSCan ; PSCan:MODE FAST   ; UDP 8012(SCAN) ; MED SCAN
     FSCAN : MODE SWEep ; UDP 8008(SCAN) 8000 8001 ; MED SCAN
@@ -52,19 +53,35 @@ class RxMode(Enum):
 
 @dataclass
 class FFMConfig:
-    center_mhz: float = 101.7
-    span_khz: float = 1000.0
-    bandwidth_khz: float = 120.0
-    ref_level_dbuv: float = 80.0
-    level_span_db: float = 10.0
+    # 射频控制参数
+    center_mhz: float = 2000.0
+    span_khz: float = 20000.0
+    step_khz: float = 6.25
+    offset_khz: float = 0.0
+    bandwidth_khz: float = 500.0
+    ref_clock: str = "0"
+    ref_level_dbuv: float = 120.0
+    level_span_db: float = 20.0
+    xdb_band_db: float = 26.0
+    beta_band_pct: float = 0.0
     demod: str = "FM"
     squelch_on: bool = False
-    threshold_dbuv: float = 10.0
-    att_auto: bool = True
+    threshold_dbuv: float = 50.0
+    level_trigger_on: bool = False
+    level_trigger_dbuv: float = 0.0
+    att_auto: bool = False
     if_att_db: float = 0.0
     rf_att_db: float = 0.0
     rf_mode: str = "NORMal"
-    detector: str = "FAST"
+    rf_mode_2: str = "NORMal"
+    rf_output_mode: str = "低速"
+    high_performance: bool = False
+    measure_time_us: int = 500
+    detector: str = "POSitive"
+    # DPX/占用率为上位机显示参数；当前接收机 SCPI 手册未定义对应命令。
+    dpx_refresh_ms: int = 100
+    echo_speed: int = 1
+    red_occupancy_pct: float = 1.0
 
 
 @dataclass
@@ -138,7 +155,7 @@ class DDCConfig:
 # ============================================================
 
 MODE_PORTS = {
-    RxMode.FFM:    [8000, 8001, 8004],
+    RxMode.FFM:    [8000, 8004],
     RxMode.PSCAN:  [8002],
     RxMode.FPSCAN: [8012],
     RxMode.FSCAN:  [8008, 8000, 8001],
@@ -249,16 +266,19 @@ class ReceiverController(QtCore.QObject):
             scpi.freq_mode(scpi.MODE_FIXED),
             scpi.freq_center(c.center_mhz),
             scpi.freq_span(c.span_khz),
+            scpi.freq_step(c.step_khz),
+            scpi.freq_offset(c.offset_khz),
             scpi.bandwidth(c.bandwidth_khz),
             scpi.demodulation(c.demod),
             scpi.detector(c.detector),
             scpi.att_auto(c.att_auto),
             scpi.squelch(c.squelch_on),
             scpi.threshold(c.threshold_dbuv),
+            scpi.meas_time(c.measure_time_us / 1000.0),
             self._udp(8000, "MEAS"),
-            self._udp(8001, "AUD"),
             self._udp(8004, "IF"),
-            scpi.trace_media(["LEVel", "SPECtrum", "ITU"]),
+            # IQ 不属于 TRAC:MED；注册 IF 通道后由 8004 输出。
+            scpi.trace_media(["SPECtrum"]),
         ]
         if not c.att_auto:
             cmds += [scpi.att_if(c.if_att_db), scpi.att_rf(c.rf_att_db)]

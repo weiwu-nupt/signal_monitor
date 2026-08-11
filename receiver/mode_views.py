@@ -83,6 +83,12 @@ class SpectrumPlot(pg.PlotWidget):
         self._mh = None
         self.maxhold.setData([], [])
 
+    def set_reference_scale(self, reference_dbuv: float, division_db: float,
+                            divisions: int = 10):
+        """设置频谱纵轴：参考电平为上边界，每格为 division_db。"""
+        self.setYRange(reference_dbuv - division_db * divisions,
+                       reference_dbuv, padding=0)
+
 
 # ============================================================
 # 瀑布图

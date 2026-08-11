@@ -121,7 +121,7 @@ class DMASpectrumSource:
         self._stats = {
             "spectrum_ok": 0,
             "signal_ok": 0,
-            "bad_crc": 0,       # No CRC is defined by the new C2H reader.
+            "bad_crc": 0,       
             "bad_packet": 0,
             "empty_poll": 0,
             "drops": 0,

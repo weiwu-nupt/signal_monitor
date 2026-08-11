@@ -45,41 +45,53 @@ QPushButton:disabled { color: #555; border-color: #222; }
 QPushButton#primary { background: #00d4ff; color: #001018; font-weight: bold; }
 QPushButton#danger { background: #3a1c22; border-color: #5a2a33; }
 QLineEdit, QComboBox {
-    background: #141923; border: 1px solid #2a3140; padding: 3px 5px;
+    background: #141923; border: 1px solid #334155; padding: 4px 30px 4px 7px;
     border-radius: 2px;
 }
+QComboBox::drop-down {
+    subcontrol-origin: padding; subcontrol-position: top right;
+    width: 24px; border-left: 1px solid #334155; background: #202b3b;
+}
+QComboBox::down-arrow {
+    width: 0; height: 0; border-left: 5px solid transparent;
+    border-right: 5px solid transparent; border-top: 6px solid #9fb0c0;
+}
+QComboBox QAbstractItemView {
+    background: #141923; border: 1px solid #3b4b63;
+    selection-background-color: #00a8cc; selection-color: #001018;
+}
 QSpinBox, QDoubleSpinBox {
-    background: #141923; border: 1px solid #2a3140;
+    background: #141923; border: 1px solid #334155;
     border-radius: 2px;
-    padding: 3px 18px 3px 5px;   /* 右侧给箭头留出 18px, 不挤压按钮 */
+    padding: 4px 26px 4px 7px;
 }
 QSpinBox::up-button, QDoubleSpinBox::up-button {
     subcontrol-origin: border; subcontrol-position: top right;
-    width: 16px; border-left: 1px solid #2a3140;
-    border-top-right-radius: 2px; background: #1c2330;
+    width: 22px; border-left: 1px solid #334155;
+    border-top-right-radius: 2px; background: #202b3b;
 }
 QSpinBox::down-button, QDoubleSpinBox::down-button {
     subcontrol-origin: border; subcontrol-position: bottom right;
-    width: 16px; border-left: 1px solid #2a3140;
-    border-bottom-right-radius: 2px; background: #1c2330;
+    width: 22px; border-left: 1px solid #334155;
+    border-bottom-right-radius: 2px; background: #202b3b;
 }
 QSpinBox::up-button:hover, QDoubleSpinBox::up-button:hover,
 QSpinBox::down-button:hover, QDoubleSpinBox::down-button:hover {
-    background: #2a3447;
+    background: #31445f;
 }
 QSpinBox::up-button:pressed, QDoubleSpinBox::up-button:pressed,
 QSpinBox::down-button:pressed, QDoubleSpinBox::down-button:pressed {
-    background: #00d4ff;
+    background: #00a8cc;
 }
 QSpinBox::up-arrow, QDoubleSpinBox::up-arrow {
     image: none; width: 0; height: 0;
-    border-left: 4px solid transparent; border-right: 4px solid transparent;
-    border-bottom: 6px solid #9fb0c0;
+    border-left: 5px solid transparent; border-right: 5px solid transparent;
+    border-bottom: 6px solid #c8d5e3;
 }
 QSpinBox::down-arrow, QDoubleSpinBox::down-arrow {
     image: none; width: 0; height: 0;
-    border-left: 4px solid transparent; border-right: 4px solid transparent;
-    border-top: 6px solid #9fb0c0;
+    border-left: 5px solid transparent; border-right: 5px solid transparent;
+    border-top: 6px solid #c8d5e3;
 }
 QTableWidget { background: #141923; gridline-color: #2a3140; }
 QHeaderView::section { background: #1c2330; padding: 4px; border: none; }
@@ -126,13 +138,14 @@ class _BasePage(QtWidgets.QWidget):
         right = QtWidgets.QScrollArea()
         right.setWidgetResizable(True)
         right.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
-        right.setMinimumWidth(280)
-        right.setMaximumWidth(340)
+        right.setMinimumWidth(410)
+        right.setMaximumWidth(480)
         self.panel = self._build_panel()
         right.setWidget(self.panel)
         split.addWidget(right)
         split.setStretchFactor(0, 4)
         split.setStretchFactor(1, 1)
+        split.setSizes([1000, 430])
         root.addWidget(split, 1)
 
         self.btn_apply.clicked.connect(self._on_apply)
@@ -191,14 +204,43 @@ class FFMPage(_BasePage):
 
     def _connect_signals(self):
         self.controller.spectrumReady.connect(self._on_spectrum)
+        self._last_ffm_update_ms = 0
+        # 首包频谱到达前，也使用右侧面板的默认配置显示坐标。
+        self._apply_display_axes(self.get_config())
+
+    def _apply_display_axes(self, config):
+        """按 FFM 配置同步频谱和瀑布图的横纵坐标。"""
+        center_hz = (config.center_mhz * 1_000_000
+                     + config.offset_khz * 1_000)
+        half_span_hz = config.span_khz * 1_000 / 2
+        start_hz = center_hz - half_span_hz
+        stop_hz = center_hz + half_span_hz
+        low_dbuv = config.ref_level_dbuv - config.level_span_db * 10
+
+        self.spectrum.enableAutoRange(axis="x", enable=False)
+        self.spectrum.enableAutoRange(axis="y", enable=False)
+        self.spectrum.setXRange(start_hz, stop_hz, padding=0)
+        self.spectrum.set_reference_scale(config.ref_level_dbuv,
+                                          config.level_span_db)
+        self.waterfall.set_freq_range(start_hz, stop_hz)
+        self.waterfall.set_levels(low_dbuv, config.ref_level_dbuv)
+
+    def _on_apply(self):
+        config = self.get_config()
+        self._apply_display_axes(config)
+        self.controller.apply_mode(self.apply_mode(), config)
 
     @QtCore.pyqtSlot(object)
     def _on_spectrum(self, d: SpectrumData):
         if self.controller.current_mode != RxMode.FFM:
             return
+        # DPX 刷新时间控制本地曲线/瀑布重绘速率，不丢弃接收机数据链路。
+        now_ms = QtCore.QDateTime.currentMSecsSinceEpoch()
+        if now_ms - self._last_ffm_update_ms < self.panel.dpx_refresh.value():
+            return
+        self._last_ffm_update_ms = now_ms
         f = d.freq_axis_hz
         self.spectrum.update_spectrum(f, d.levels_db)
-        self.waterfall.set_freq_range(float(f[0]), float(f[-1]))
         self.waterfall.push_row(d.levels_db)
 
 
