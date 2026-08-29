@@ -6,7 +6,12 @@ FPGA 频谱分析器 主窗口
 """
 
 from __future__ import annotations
-from dma_source import DMASpectrumSource
+from fpga_closed_loop import (
+    EnergyDetector,
+    SpectrumDDCClosedLoop,
+    FPGASpectrumMessage,
+    TargetFilter,
+)
 
 
 import sys
@@ -17,7 +22,7 @@ import numpy as np
 from PyQt6 import QtCore, QtGui, QtWidgets
 import pyqtgraph as pg
 
-from data_source import DataSource, create_source
+from data_source import DataSource
 from protocol import SpectrumMessage, SignalMessage
 from waterfall import WaterfallView
 
@@ -57,6 +62,7 @@ class SpectrumView(pg.PlotWidget):
 
         self._cur_freq: np.ndarray = np.array([])
         self._cur_spec: np.ndarray = np.array([])
+        self._signal_box_items = []
 
         # 鼠标十字线 + 节流
         self._vline = pg.InfiniteLine(angle=90, pen=pg.mkPen("#555"))
@@ -81,6 +87,40 @@ class SpectrumView(pg.PlotWidget):
             else:
                 np.maximum(self._maxhold_data, spec_db, out=self._maxhold_data)
             self._maxhold.setData(freq_hz, self._maxhold_data)
+
+    def set_signal_boxes(self, detected_targets, selected_targets) -> None:
+        """Draw numbered occupied-band boxes; green boxes are IQ-selected."""
+        for item in self._signal_box_items:
+            self.removeItem(item)
+        self._signal_box_items.clear()
+        if self._cur_freq.size == 0:
+            return
+        selected = set(selected_targets)
+        for index, target in enumerate(detected_targets, start=1):
+            left = target.center_hz - target.bandwidth_hz / 2.0
+            right = target.center_hz + target.bandwidth_hz / 2.0
+            mask = (self._cur_freq >= left) & (self._cur_freq <= right)
+            if not np.any(mask):
+                continue
+            segment = self._cur_spec[mask]
+            bottom = float(segment.min()) - 2.0
+            top = float(segment.max()) + 2.0
+            is_selected = target in selected
+            color = "#35d07f" if is_selected else "#8a919d"
+            style = QtCore.Qt.PenStyle.SolidLine if is_selected else QtCore.Qt.PenStyle.DashLine
+            rect = QtWidgets.QGraphicsRectItem(left, bottom, right - left, top - bottom)
+            rect.setPen(pg.mkPen(color=color, width=1.5, style=style))
+            self.addItem(rect)
+            label = pg.TextItem(
+                html=(
+                    f"<span style='color:{color}; font-weight:600'>"
+                    f"#{index}{'' if is_selected else ' (filtered)'}</span>"
+                ),
+                anchor=(0, 1),
+            )
+            label.setPos(left, top)
+            self.addItem(label)
+            self._signal_box_items.extend((rect, label))
 
     def set_maxhold(self, enabled: bool) -> None:
         self._maxhold.setVisible(enabled)
@@ -128,6 +168,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._last_spectrum: Optional[SpectrumMessage] = None
 
         self._build_ui()
+        self._apply_target_bandwidth_filter()
         self._build_menu()
 
         self._poll_timer = QtCore.QTimer(self)
@@ -206,6 +247,41 @@ class MainWindow(QtWidgets.QMainWindow):
         btn_clear_wf.clicked.connect(self.waterfall_view.clear)
         wlyt.addRow(btn_clear_wf)
         plyt.addWidget(grp_wf)
+
+        # 实时能量检测门限；调整后从下一帧开始生效。
+        grp_detect = QtWidgets.QGroupBox("Energy Detection")
+        dlyt = QtWidgets.QFormLayout(grp_detect)
+        self.spin_detect_snr = QtWidgets.QDoubleSpinBox()
+        self.spin_detect_snr.setRange(0.5, 30.0)
+        self.spin_detect_snr.setSingleStep(0.5)
+        self.spin_detect_snr.setDecimals(1)
+        self.spin_detect_snr.setValue(4.0)
+        self.spin_detect_snr.setSuffix(" dB above noise floor")
+        self.spin_detect_snr.valueChanged.connect(self._on_detect_snr_changed)
+        dlyt.addRow("Threshold:", self.spin_detect_snr)
+        plyt.addWidget(grp_detect)
+
+        # DDC IQ请求筛选。频谱仍显示全部检测结果，只有范围内的才下发FPGA。
+        grp_target = QtWidgets.QGroupBox("IQ Target Bandwidth")
+        tlyt = QtWidgets.QFormLayout(grp_target)
+        self.spin_target_bw_min = QtWidgets.QDoubleSpinBox()
+        self.spin_target_bw_min.setRange(0.0, 4096.0)
+        self.spin_target_bw_min.setValue(30.0)
+        self.spin_target_bw_min.setDecimals(3)
+        self.spin_target_bw_min.setSuffix(" MHz")
+        self.spin_target_bw_max = QtWidgets.QDoubleSpinBox()
+        self.spin_target_bw_max.setRange(0.0, 4096.0)
+        self.spin_target_bw_max.setValue(40.0)
+        self.spin_target_bw_max.setDecimals(3)
+        self.spin_target_bw_max.setSuffix(" MHz")
+        self.spin_target_bw_min.valueChanged.connect(self._on_target_bandwidth_changed)
+        self.spin_target_bw_max.valueChanged.connect(self._on_target_bandwidth_changed)
+        tlyt.addRow("Minimum:", self.spin_target_bw_min)
+        tlyt.addRow("Maximum:", self.spin_target_bw_max)
+        self.lbl_target_filter = QtWidgets.QLabel("Request IQ: 30.000–40.000 MHz")
+        self.lbl_target_filter.setWordWrap(True)
+        tlyt.addRow(self.lbl_target_filter)
+        plyt.addWidget(grp_target)
 
         # 帧信息
         grp_info = QtWidgets.QGroupBox("Frame Info")
@@ -315,6 +391,11 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # 频谱图
         self.spectrum_view.update_spectrum(freq, spec)
+        if isinstance(msg, FPGASpectrumMessage):
+            self.spectrum_view.set_signal_boxes(
+                msg.detected_targets,
+                msg.selected_targets,
+            )
 
         # 瀑布图
         self.waterfall_view.set_levels(lo, hi)
@@ -353,6 +434,27 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         self.waterfall_view.set_levels(low, high)
 
+    def _on_target_bandwidth_changed(self) -> None:
+        self._apply_target_bandwidth_filter()
+
+    def _on_detect_snr_changed(self) -> None:
+        setter = getattr(self.source, "set_detector_snr_db", None)
+        if setter is not None:
+            setter(self.spin_detect_snr.value())
+
+    def _apply_target_bandwidth_filter(self) -> None:
+        minimum = self.spin_target_bw_min.value()
+        maximum = self.spin_target_bw_max.value()
+        if minimum > maximum:
+            self.lbl_target_filter.setText("Invalid range: minimum exceeds maximum")
+            return
+        self.lbl_target_filter.setText(
+            f"Request IQ: {minimum:.3f}–{maximum:.3f} MHz"
+        )
+        setter = getattr(self.source, "set_bandwidth_filter", None)
+        if setter is not None:
+            setter(minimum * 1e6, maximum * 1e6)
+
     def _export_csv(self) -> None:
         if self._last_spectrum is None:
             return
@@ -378,39 +480,26 @@ class MainWindow(QtWidgets.QMainWindow):
 
 def main():
     import argparse
-    parser = argparse.ArgumentParser(description="FPGA Spectrum Analyzer")
-    parser.add_argument("--mode", choices=["sim", "pcie", "dma"], default="dma")
-    parser.add_argument("--device", default="/dev/xdma0_c2h_0",
-                        help="PCIe 字符设备路径")
-    parser.add_argument("--fft", type=int, default=65535,
-                        help="FFT 点数")
-    parser.add_argument("--center", type=int, default=1500,
-                        help="中心频率 (MHz, 仿真用)")
-    parser.add_argument("--bw", type=int, default=300,
-                        help="带宽 (MHz, 仿真用)")
-    parser.add_argument("--rate", type=float, default=1.0,
-                        help="帧率 Hz (仿真用)")
+    parser = argparse.ArgumentParser(
+        description="FPGA spectrum detection, target selection, and DDC IQ capture"
+    )
+    parser.add_argument("--detect-min-guard-hz", type=float, default=25e3,
+                        help="检测最小单侧保护带宽(Hz)，默认25 kHz")
+    parser.add_argument("--detect-relative-guard", type=float, default=0.10,
+                        help="单侧保护带占检测带宽的比例，默认10%%")
+    parser.add_argument("--detect-max-guard-hz", type=float, default=2e6,
+                        help="单侧保护带宽上限(Hz)，默认2 MHz")
     args = parser.parse_args()
 
-    if args.mode == "sim":
-        source = create_source(
-            "sim",
-            fft_points=args.fft,
-            center_mhz=args.center,
-            bandwidth_mhz=args.bw,
-            frame_rate_hz=args.rate,
-        )
-    elif args.mode == "dma":
-        # 真实硬件: 从 C2H 连续读取 8192 点频谱包。
-        source = DMASpectrumSource(
-            c2h_dev=args.device,
-        )
-    else:
-        source = create_source(
-            "pcie",
-            device_path=args.device,
-            fft_points=args.fft,
-        )
+    # This application has one hardware workflow and owns C2H0..C2H3.
+    source = SpectrumDDCClosedLoop(
+        detector=EnergyDetector(
+            min_guard_hz=args.detect_min_guard_hz,
+            relative_guard=args.detect_relative_guard,
+            max_guard_hz=args.detect_max_guard_hz,
+        ),
+        target_filter=TargetFilter(),
+    )
 
     app = QtWidgets.QApplication(sys.argv)
     win = MainWindow(source)
