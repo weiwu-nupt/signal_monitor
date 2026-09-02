@@ -18,8 +18,10 @@ import errno
 import mmap
 import os
 import struct
+import sys
 import threading
 import time
+import traceback
 from dataclasses import dataclass
 from queue import Empty, Full, Queue
 from typing import Callable, Optional
@@ -32,6 +34,11 @@ from protocol import SpectrumMessage
 SYNC_WORD = 0x1ACF_FC1D
 HEADER_BYTES = 32
 WIDE_NFFT, NARROW_NFFT = 8192, 16384
+NARROW_CHANNELS = 64
+NARROW_MAIN_CHANNELS = 32
+SYSTEM_SAMPLE_RATE_HZ = 409_600_000
+NARROW_CHANNEL_BANDWIDTH_HZ = 12_800_000
+NARROW_DISPLAY_POINTS_PER_CHANNEL = NARROW_NFFT // 2
 WIDE_PACKET_BYTES = HEADER_BYTES + WIDE_NFFT * 8
 NARROW_PACKET_BYTES = HEADER_BYTES + NARROW_NFFT * 8
 IQ_BYTES = 4 * 1024 * 1024
@@ -50,6 +57,14 @@ TARGET_MESSAGE_LENGTH = 13
 MAX_WIDE_TARGETS, MAX_NARROW_TARGETS = 2, 128
 BASEBAND_LIMIT_HZ = 204_800_000
 O_SYNC = getattr(os, "O_SYNC", 0)
+
+if os.name == "posix":
+    _libc = ctypes.CDLL(None, use_errno=True)
+    _native_read = _libc.read
+    _native_read.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_size_t]
+    _native_read.restype = ctypes.c_ssize_t
+else:
+    _native_read = None
 
 
 @dataclass(frozen=True)
@@ -98,10 +113,17 @@ class FPGASpectrumMessage(SpectrumMessage):
     selected_targets: tuple[Target, ...] = ()
     raw_power: Optional[np.ndarray] = None
     _power_db: Optional[np.ndarray] = None
+    _frequency_hz: Optional[np.ndarray] = None
 
     @property
     def spectrum_db(self) -> np.ndarray:  # type: ignore[override]
         return self._power_db if self._power_db is not None else self.samples.astype(np.float32)
+
+    @property
+    def freq_axis_hz(self) -> np.ndarray:  # type: ignore[override]
+        if self._frequency_hz is not None:
+            return self._frequency_hz
+        return super().freq_axis_hz
 
 
 def _parse_header(packet: bytes, expected_type: int, expected_length: int, expected_nfft: Optional[int] = None) -> dict[str, int]:
@@ -138,6 +160,78 @@ def parse_narrow_packet(packet: bytes) -> tuple[dict[str, int], np.ndarray]:
     return header, np.frombuffer(packet, dtype="<u8", count=NARROW_NFFT, offset=HEADER_BYTES).copy()
 
 
+class NarrowSpectrumAssembler:
+    """Assemble the 64 ordered C2H1 packets into one circular 409.6 MHz view.
+
+    C2H1 arrival order is Main0..31 then Shift0..31.  It is not frequency
+    order.  Main and Shift are interleaved after their physical frequency is
+    folded into [-204.8 MHz, +204.8 MHz).  From every 16384-bin packet only the
+    centre 8192 bins are retained, giving exactly 409600000 / 781.25 Hz bins.
+    """
+
+    def __init__(self) -> None:
+        self._expected_sequence = 0
+        self._channels: list[np.ndarray] = []
+
+    @staticmethod
+    def center_hz(sequence: int) -> float:
+        if not 0 <= sequence < NARROW_CHANNELS:
+            raise ValueError("narrow sequence must be 0..63")
+        if sequence < NARROW_MAIN_CHANNELS:
+            unfolded_hz = sequence * NARROW_CHANNEL_BANDWIDTH_HZ
+        else:
+            unfolded_hz = (
+                (sequence - NARROW_MAIN_CHANNELS) * NARROW_CHANNEL_BANDWIDTH_HZ
+                - NARROW_CHANNEL_BANDWIDTH_HZ / 2.0
+            )
+        return (
+            (unfolded_hz + SYSTEM_SAMPLE_RATE_HZ / 2.0) % SYSTEM_SAMPLE_RATE_HZ
+            - SYSTEM_SAMPLE_RATE_HZ / 2.0
+        )
+
+    @staticmethod
+    def _middle_bins(power: np.ndarray) -> np.ndarray:
+        start = (NARROW_NFFT - NARROW_DISPLAY_POINTS_PER_CHANNEL) // 2
+        return power[start:start + NARROW_DISPLAY_POINTS_PER_CHANNEL]
+
+    def add(self, header: dict[str, int], power: np.ndarray) -> Optional[tuple[np.ndarray, np.ndarray]]:
+        sequence = header["sequence"]
+        # Sequence 0 is the only reliable result boundary.  A restart or a
+        # missing packet discards the incomplete previous result.
+        if sequence == 0:
+            self._channels = []
+            self._expected_sequence = 0
+        if sequence != self._expected_sequence:
+            self._channels = []
+            self._expected_sequence = 0
+            if sequence != 0:
+                return None
+        self._channels.append(self._middle_bins(power).copy())
+        self._expected_sequence += 1
+        if self._expected_sequence != NARROW_CHANNELS:
+            return None
+
+        bin_hz = NARROW_CHANNEL_BANDWIDTH_HZ / NARROW_NFFT
+        chunks: list[np.ndarray] = []
+        frequencies: list[np.ndarray] = []
+        for sequence, values in enumerate(self._channels):
+            center = self.center_hz(sequence)
+            first_hz = center - NARROW_CHANNEL_BANDWIDTH_HZ / 4.0
+            frequency = first_hz + np.arange(values.size, dtype=np.float64) * bin_hz
+            frequency = (
+                (frequency + SYSTEM_SAMPLE_RATE_HZ / 2.0) % SYSTEM_SAMPLE_RATE_HZ
+                - SYSTEM_SAMPLE_RATE_HZ / 2.0
+            )
+            chunks.append(values)
+            frequencies.append(frequency)
+        all_power = np.concatenate(chunks)
+        all_frequency = np.concatenate(frequencies)
+        order = np.argsort(all_frequency, kind="stable")
+        self._channels = []
+        self._expected_sequence = 0
+        return all_frequency[order], all_power[order]
+
+
 def parse_iq_packet(packet: bytes, target_type: str) -> IQPacket:
     if len(packet) != IQ_PACKET_BYTES:
         raise RuntimeError(f"IQ packet length={len(packet)}, expected={IQ_PACKET_BYTES}")
@@ -160,30 +254,109 @@ def parse_iq_packet(packet: bytes, target_type: str) -> IQPacket:
 class StreamPacketReader:
     """Packet-size reads with sync recovery; one instance owns one C2H fd."""
 
-    def __init__(self, device: str, packet_bytes: int, parser: Callable[[bytes], object], *, packet_mode: bool = False):
+    def __init__(
+        self,
+        device: str,
+        packet_bytes: int,
+        parser: Callable[[bytes], object],
+        *,
+        packet_mode: bool = False,
+        page_aligned: bool = False,
+    ):
         self.device, self.packet_bytes, self.parser = device, packet_bytes, parser
         flags = (os.O_RDWR | os.O_TRUNC | O_SYNC) if packet_mode else (os.O_RDONLY | O_SYNC)
         self.fd = os.open(device, flags)
         self.buffer = bytearray()
         self._closed = False
+        self._read_count = 0
+        self._packet_count = 0
+        self._reject_count = 0
+        self._empty_reads = 0
+        self._dma_mmap = None
+        self._dma_view = None
+        self._dma_address = None
+        self._page_aligned = page_aligned
+        self._request_bytes = packet_bytes
+        if page_aligned:
+            if _native_read is None:
+                raise RuntimeError("page-aligned XDMA read requires Linux native read(2)")
+            # EOP/TLAST packet channels need a page-sized request capacity;
+            # C2H1 uses one full 131104-byte channel-packet request.
+            self._request_bytes = (
+                (packet_bytes + mmap.PAGESIZE - 1) // mmap.PAGESIZE
+            ) * mmap.PAGESIZE if packet_mode else packet_bytes
+            allocation = (
+                (self._request_bytes + mmap.PAGESIZE - 1) // mmap.PAGESIZE
+            ) * mmap.PAGESIZE
+            self._dma_mmap = mmap.mmap(-1, allocation, access=mmap.ACCESS_WRITE)
+            self._dma_view = memoryview(self._dma_mmap)[:self._request_bytes]
+            self._dma_address = ctypes.addressof(
+                ctypes.c_ubyte.from_buffer(self._dma_mmap)
+            )
+            if self._dma_address % mmap.PAGESIZE:
+                self.close()
+                raise RuntimeError(f"{device} DMA buffer is not page-aligned")
+        mode = "EOP packet" if packet_mode else "spectrum stream"
+        print(
+            f"[FPGA RX] opened {device}: fd={self.fd}, mode={mode}, "
+            f"packet_bytes={packet_bytes}, page_aligned={page_aligned}, "
+            f"read_request={self._request_bytes}",
+            flush=True,
+        )
 
     def close(self) -> None:
         if not self._closed:
             self._closed = True
-            os.close(self.fd)
+            try:
+                os.close(self.fd)
+            finally:
+                if self._dma_view is not None:
+                    self._dma_view.release()
+                    self._dma_view = None
+                if self._dma_mmap is not None:
+                    self._dma_mmap.close()
+                    self._dma_mmap = None
+
+    def _read_once(self) -> bytes:
+        if not self._page_aligned:
+            return os.read(self.fd, max(self.packet_bytes, 32))
+        ctypes.set_errno(0)
+        count = _native_read(self.fd, self._dma_address, self._request_bytes)
+        if count < 0:
+            error = ctypes.get_errno()
+            raise OSError(error, os.strerror(error))
+        if count > self._request_bytes:
+            raise RuntimeError(f"{self.device} returned oversized DMA read: {count}")
+        return bytes(self._dma_view[:count])
 
     def next(self):
         sync = struct.pack("<I", SYNC_WORD)
         while True:
             while len(self.buffer) < self.packet_bytes:
                 try:
-                    data = os.read(self.fd, max(self.packet_bytes, 32))
+                    data = self._read_once()
                 except OSError as exc:
                     if exc.errno in (errno.EINTR, 512):
                         continue
                     raise
                 if not data:
-                    raise RuntimeError(f"{self.device} returned empty data")
+                    # C2H2/C2H3 return zero bytes until an accepted target
+                    # actually completes one 4 MiB IQ packet.  Keep waiting.
+                    self._empty_reads += 1
+                    if self._empty_reads == 1:
+                        print(
+                            f"[FPGA RX] {self.device} has no complete packet yet; waiting",
+                            flush=True,
+                        )
+                    time.sleep(0.01)
+                    continue
+                self._read_count += 1
+                if self._read_count <= 3:
+                    print(
+                        f"[FPGA RX] {self.device} read#{self._read_count}: "
+                        f"{len(data)} bytes",
+                        flush=True,
+                    )
                 self.buffer.extend(data)
             offset = self.buffer.find(sync)
             if offset < 0:
@@ -195,10 +368,26 @@ class StreamPacketReader:
             packet = bytes(self.buffer[:self.packet_bytes])
             try:
                 result = self.parser(packet)
-            except RuntimeError:
+            except RuntimeError as exc:
+                self._reject_count += 1
+                if self._reject_count <= 3:
+                    print(
+                        f"[FPGA RX] {self.device} rejected packet candidate "
+                        f"#{self._reject_count}: {exc}; header={packet[:32].hex()}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
                 del self.buffer[:1]
                 continue
             del self.buffer[:self.packet_bytes]
+            self._packet_count += 1
+            if self._packet_count <= 3:
+                header = result[0] if isinstance(result, tuple) else None
+                print(
+                    f"[FPGA RX] {self.device} accepted packet#{self._packet_count}: "
+                    f"header={header}",
+                    flush=True,
+                )
             return result
 
 
@@ -361,6 +550,7 @@ class SpectrumDDCClosedLoop:
         self.target_filter = target_filter or TargetFilter()
         self.target_interval_s = target_interval_s
         self._queue: Queue[FPGASpectrumMessage] = Queue(maxsize=queue_size)
+        self._narrow_assembler = NarrowSpectrumAssembler()
         self._iq_queue: Queue[IQPacket] = Queue(maxsize=16)
         self._running = False
         self._threads: list[threading.Thread] = []
@@ -409,6 +599,11 @@ class SpectrumDDCClosedLoop:
         if self._running:
             return
         self._running = True
+        print(
+            "[FPGA] starting closed loop: C2H0/C2H1 spectrum, "
+            "C2H2/C2H3 IQ, H2C1 targets",
+            flush=True,
+        )
         for name, fn in (("WideSpectrum", self._wide_loop), ("NarrowSpectrum", self._narrow_loop), ("WideIQ", lambda: self._iq_loop("wide")), ("NarrowIQ", lambda: self._iq_loop("narrow"))):
             thread = threading.Thread(target=self._guarded, args=(fn,), name=name, daemon=True)
             thread.start()
@@ -440,6 +635,12 @@ class SpectrumDDCClosedLoop:
         try:
             fn()
         except Exception as exc:
+            print(
+                f"[FPGA ERROR] {threading.current_thread().name}: "
+                f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}",
+                file=sys.stderr,
+                flush=True,
+            )
             if self._running and self._error_callback:
                 self._error_callback(exc)
 
@@ -464,15 +665,43 @@ class SpectrumDDCClosedLoop:
             reader.close()
 
     def _narrow_loop(self) -> None:
-        reader = StreamPacketReader(NARROW_DEVICE, NARROW_PACKET_BYTES, parse_narrow_packet)
+        reader = StreamPacketReader(
+            NARROW_DEVICE, NARROW_PACKET_BYTES, parse_narrow_packet,
+            page_aligned=True,
+        )
         try:
             while self._running:
                 header, power = reader.next()
-                self._handle_spectrum(header, power, "narrow")
+                assembled = self._narrow_assembler.add(header, power)
+                if assembled is None:
+                    continue
+                frequency_hz, assembled_power = assembled
+                # The C2H1 header belongs to one 12.8 MHz channel only.  Once
+                # Main0..31 and Shift0..31 have been assembled, this synthetic
+                # header describes the true, sorted 409.6 MHz fine spectrum.
+                self._handle_spectrum(
+                    {
+                        "sequence": 0,
+                        "center_hz": 0,
+                        "bandwidth_hz": SYSTEM_SAMPLE_RATE_HZ,
+                        "sample_rate_hz": SYSTEM_SAMPLE_RATE_HZ,
+                        "fft_points": assembled_power.size,
+                    },
+                    assembled_power,
+                    "narrow",
+                    frequency_hz=frequency_hz,
+                )
         finally:
             reader.close()
 
-    def _handle_spectrum(self, header: dict[str, int], power: np.ndarray, target_type: str) -> None:
+    def _handle_spectrum(
+        self,
+        header: dict[str, int],
+        power: np.ndarray,
+        target_type: str,
+        *,
+        frequency_hz: Optional[np.ndarray] = None,
+    ) -> None:
         peak = max(float(power.max()), np.finfo(np.float64).tiny)
         db = np.maximum(10.0 * np.log10(np.maximum(power.astype(np.float64), np.finfo(np.float64).tiny) / peak), -120.0).astype(np.float32)
         maximum = MAX_WIDE_TARGETS if target_type == "wide" else MAX_NARROW_TARGETS
@@ -480,18 +709,69 @@ class SpectrumDDCClosedLoop:
             power, header["center_hz"], header["bandwidth_hz"], target_type,
             maximum, stream_id=(target_type, header["sequence"]),
         )
-        selected = [target for target in detected if self.target_filter.allows(target)]
+        selected = [
+            target
+            for target in detected
+            if self.target_filter.allows(target)
+            # Type 0x02 DDC is one 12.8 MHz narrow channel.  A broad region
+            # visible in the stitched fine spectrum is useful for display,
+            # but it must not be encoded as an invalid narrow IQ request.
+            and (
+                target.target_type != "narrow"
+                or target.bandwidth_hz <= NARROW_CHANNEL_BANDWIDTH_HZ
+            )
+        ]
         with self._lock:
             self._latest_detected[(target_type, header["sequence"])] = detected
             self._latest_targets[(target_type, header["sequence"])] = selected
         # C2H0 is a coarse analysis path only.  GUI rendering receives C2H1.
         if target_type == "narrow":
             message = FPGASpectrumMessage(
-                header["center_hz"], header["bandwidth_hz"], header["fft_points"],
-                db, True, target_type, header["sequence"], tuple(detected),
-                tuple(selected), power, db,
+                center_freq_hz=header["center_hz"],
+                bandwidth_hz=header["bandwidth_hz"],
+                fft_points=header["fft_points"],
+                samples=db,
+                crc_ok=True,
+                target_type=target_type,
+                sequence=header["sequence"],
+                detected_targets=tuple(detected),
+                selected_targets=tuple(selected),
+                raw_power=power,
+                _power_db=db,
+                _frequency_hz=frequency_hz,
             )
             self._push(self._queue, message)
+            print(
+                f"[FPGA] C2H1 assembled: bins={power.size}, "
+                f"range={frequency_hz[0] / 1e6:.3f}..{frequency_hz[-1] / 1e6:.3f} MHz, "
+                f"detected={len(detected)}, IQ-selected={len(selected)}",
+                flush=True,
+            )
+        else:
+            if self._stats["spectrum_ok"] < 3:
+                print(
+                    f"[FPGA] C2H0 wide spectrum: peak={int(power.max())}, "
+                    f"detected={len(detected)}, IQ-selected={len(selected)}",
+                    flush=True,
+                )
+            # C2H0 is not the primary GUI source, but it is delivered as a
+            # reference trace so the user can validate C2H1 channel stitching.
+            self._push(
+                self._queue,
+                FPGASpectrumMessage(
+                    center_freq_hz=header["center_hz"],
+                    bandwidth_hz=header["bandwidth_hz"],
+                    fft_points=header["fft_points"],
+                    samples=db,
+                    crc_ok=True,
+                    target_type="wide",
+                    sequence=header["sequence"],
+                    detected_targets=tuple(detected),
+                    selected_targets=tuple(selected),
+                    raw_power=power,
+                    _power_db=db,
+                ),
+            )
         self._stats["spectrum_ok"] += 1
         self._maybe_send_targets()
 
@@ -523,7 +803,13 @@ class SpectrumDDCClosedLoop:
 
     def _iq_loop(self, target_type: str) -> None:
         device = WIDE_IQ_DEVICE if target_type == "wide" else NARROW_IQ_DEVICE
-        reader = StreamPacketReader(device, IQ_PACKET_BYTES, lambda packet: parse_iq_packet(packet, target_type), packet_mode=True)
+        reader = StreamPacketReader(
+            device,
+            IQ_PACKET_BYTES,
+            lambda packet: parse_iq_packet(packet, target_type),
+            packet_mode=True,
+            page_aligned=True,
+        )
         try:
             while self._running:
                 iq = reader.next()

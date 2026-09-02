@@ -103,6 +103,101 @@ class SpectrumData:
         return np.linspace(start, stop, self.count, dtype=np.float64)
 
 
+class SpectrumStitcher:
+    """将细粒度频谱分片拼接成一个配置频段内的完整频谱。
+
+    接收机 FFM 的细粒度频谱会把一个配置跨距拆为多个 UDP 包；每个包
+    都包含自己覆盖的中心频率、跨距和频谱点。显示层必须在完整频段补齐
+    后再刷新，否则瀑布图会把单个窄频段包拉伸成整行。
+    """
+
+    def __init__(self) -> None:
+        self._center_hz = 0.0
+        self._span_hz = 0.0
+        self._start_hz = 0.0
+        self._stop_hz = 0.0
+        self._axis: Optional[np.ndarray] = None
+        self._levels: Optional[np.ndarray] = None
+        self._covered: Optional[np.ndarray] = None
+        self._last_fragment_start_hz: Optional[float] = None
+
+    def configure(self, center_hz: float, span_hz: float) -> None:
+        """设置目标频段；配置变化时丢弃尚未完成的旧拼接帧。"""
+        self._center_hz = float(center_hz)
+        self._span_hz = float(span_hz)
+        self._start_hz = self._center_hz - self._span_hz / 2
+        self._stop_hz = self._center_hz + self._span_hz / 2
+        self._reset_frame()
+
+    def add(self, fragment: SpectrumData) -> Optional[SpectrumData]:
+        """加入一个频谱分片；完整拼接完成时返回一帧，否则返回 ``None``。"""
+        if self._span_hz <= 0 or fragment.count < 2 or len(fragment.levels_db) < 2:
+            return None
+
+        source_axis = fragment.freq_axis_hz
+        if source_axis[-1] < self._start_hz or source_axis[0] > self._stop_hz:
+            return None
+        self._ensure_frame(source_axis)
+        if self._axis is None or self._levels is None or self._covered is None:
+            return None
+
+        dst = np.flatnonzero((self._axis >= source_axis[0]) &
+                             (self._axis <= source_axis[-1]))
+        if not len(dst):
+            return None
+
+        # 细粒度扫频的相邻分片通常高度重叠，不能用覆盖率判断新帧。
+        # 只有扫频序列从高频端回绕到低频端时才丢弃未完成的旧帧。
+        source_start_hz = float(source_axis[0])
+        wrap_tolerance_hz = max(1.0, abs(float(source_axis[-1] - source_axis[0])) * 0.01)
+        wrapped = (self._last_fragment_start_hz is not None
+                   and source_start_hz < self._last_fragment_start_hz - wrap_tolerance_hz)
+        if self._covered.all() or wrapped:
+            self._reset_frame(keep_axis=True)
+            assert self._levels is not None and self._covered is not None
+
+        self._levels[dst] = np.interp(self._axis[dst], source_axis,
+                                      fragment.levels_db).astype(np.float32)
+        self._covered[dst] = True
+        self._last_fragment_start_hz = source_start_hz
+        if not self._covered.all():
+            return None
+
+        complete = SpectrumData(
+            frequency_hz=int(round(self._center_hz)),
+            span_hz=int(round(self._span_hz)),
+            attenuation=fragment.attenuation,
+            count=len(self._axis),
+            levels_db=self._levels.copy(),
+            meta=fragment.meta,
+        )
+        # 保留已填充缓存，下一轮首个重叠分片会自动开始新的拼接周期。
+        return complete
+
+    def _ensure_frame(self, source_axis: np.ndarray) -> None:
+        if self._axis is not None:
+            return
+        bin_hz = abs(float(source_axis[-1] - source_axis[0])) / (len(source_axis) - 1)
+        if bin_hz <= 0:
+            return
+        count = max(2, int(round(self._span_hz / bin_hz)) + 1)
+        self._axis = np.linspace(self._start_hz, self._stop_hz, count,
+                                 dtype=np.float64)
+        self._levels = np.full(count, np.nan, dtype=np.float32)
+        self._covered = np.zeros(count, dtype=bool)
+
+    def _reset_frame(self, keep_axis: bool = False) -> None:
+        if keep_axis and self._axis is not None:
+            self._levels = np.full(len(self._axis), np.nan, dtype=np.float32)
+            self._covered = np.zeros(len(self._axis), dtype=bool)
+            self._last_fragment_start_hz = None
+            return
+        self._axis = None
+        self._levels = None
+        self._covered = None
+        self._last_fragment_start_hz = None
+
+
 @dataclass
 class ScanData:
     """PSCAN(NORMAL) / FSCAN / MSCAN 共用 (tag 128/130/132)"""

@@ -24,7 +24,7 @@ from .mode_views import (
     SpectrumPlot, WaterfallPlot, ScanPlot, FastScanPlot, ChannelBars,
 )
 from .rx_protocol import (
-    SpectrumData, ScanData, FastScanData, LevelData, DDCData,
+    SpectrumData, SpectrumStitcher, ScanData, FastScanData, LevelData, DDCData,
 )
 
 
@@ -205,6 +205,7 @@ class FFMPage(_BasePage):
     def _connect_signals(self):
         self.controller.spectrumReady.connect(self._on_spectrum)
         self._last_ffm_update_ms = 0
+        self._spectrum_stitcher = SpectrumStitcher()
         # 首包频谱到达前，也使用右侧面板的默认配置显示坐标。
         self._apply_display_axes(self.get_config())
 
@@ -224,6 +225,7 @@ class FFMPage(_BasePage):
                                           config.level_span_db)
         self.waterfall.set_freq_range(start_hz, stop_hz)
         self.waterfall.set_levels(low_dbuv, config.ref_level_dbuv)
+        self._spectrum_stitcher.configure(center_hz, config.span_khz * 1_000)
 
     def _on_apply(self):
         config = self.get_config()
@@ -234,14 +236,16 @@ class FFMPage(_BasePage):
     def _on_spectrum(self, d: SpectrumData):
         if self.controller.current_mode != RxMode.FFM:
             return
+        complete = self._spectrum_stitcher.add(d)
+        if complete is None:
+            return
         # DPX 刷新时间控制本地曲线/瀑布重绘速率，不丢弃接收机数据链路。
         now_ms = QtCore.QDateTime.currentMSecsSinceEpoch()
         if now_ms - self._last_ffm_update_ms < self.panel.dpx_refresh.value():
             return
         self._last_ffm_update_ms = now_ms
-        f = d.freq_axis_hz
-        self.spectrum.update_spectrum(f, d.levels_db)
-        self.waterfall.push_row(d.levels_db)
+        self.spectrum.update_spectrum(complete.freq_axis_hz, complete.levels_db)
+        self.waterfall.push_row(complete.levels_db)
 
 
 # ============================================================

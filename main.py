@@ -48,11 +48,21 @@ class SpectrumView(pg.PlotWidget):
         self.setLabel("bottom", "Frequency", units="Hz")
         self.setLabel("left", "Power", units="dB")
         self.showGrid(x=True, y=True, alpha=0.25)
+        self.addLegend(offset=(10, 10))
 
         self.setDownsampling(auto=True, mode="peak")
         self.setClipToView(True)
 
-        self._curve = self.plot(pen=pg.mkPen(color="#00d4ff", width=1.2))
+        self._curve = self.plot(
+            pen=pg.mkPen(color="#00d4ff", width=1.2),
+            name="C2H1 fine assembled",
+        )
+        self._wide_reference = self.plot(
+            pen=pg.mkPen(color="#ffd166", width=1.4,
+                         style=QtCore.Qt.PenStyle.DashLine),
+            name="C2H0 coarse reference",
+        )
+        self._wide_reference.setVisible(True)
         self._maxhold = self.plot(
             pen=pg.mkPen(color="#ff8c42", width=1.0,
                          style=QtCore.Qt.PenStyle.DashLine)
@@ -88,6 +98,13 @@ class SpectrumView(pg.PlotWidget):
                 np.maximum(self._maxhold_data, spec_db, out=self._maxhold_data)
             self._maxhold.setData(freq_hz, self._maxhold_data)
 
+    def update_wide_reference(self, freq_hz: np.ndarray, spec_db: np.ndarray) -> None:
+        """Overlay C2H0 on the C2H1 view without affecting waterfall data."""
+        self._wide_reference.setData(freq_hz, spec_db)
+
+    def set_wide_reference_visible(self, visible: bool) -> None:
+        self._wide_reference.setVisible(visible)
+
     def set_signal_boxes(self, detected_targets, selected_targets) -> None:
         """Draw numbered occupied-band boxes; green boxes are IQ-selected."""
         for item in self._signal_box_items:
@@ -96,7 +113,11 @@ class SpectrumView(pg.PlotWidget):
         if self._cur_freq.size == 0:
             return
         selected = set(selected_targets)
-        for index, target in enumerate(detected_targets, start=1):
+        counters = {"wide": 0, "narrow": 0}
+        for target in detected_targets:
+            counters[target.target_type] = counters.get(target.target_type, 0) + 1
+            source_tag = "W" if target.target_type == "wide" else "N"
+            signal_id = f"{source_tag}{counters[target.target_type]}"
             left = target.center_hz - target.bandwidth_hz / 2.0
             right = target.center_hz + target.bandwidth_hz / 2.0
             mask = (self._cur_freq >= left) & (self._cur_freq <= right)
@@ -114,11 +135,15 @@ class SpectrumView(pg.PlotWidget):
             label = pg.TextItem(
                 html=(
                     f"<span style='color:{color}; font-weight:600'>"
-                    f"#{index}{'' if is_selected else ' (filtered)'}</span>"
+                    f"#{signal_id}: {target.center_hz / 1e6:.2f} MHz, "
+                    f"{target.bandwidth_hz / 1e6:.2f} MHz"
+                    f"{'' if is_selected else ' (filtered)'}</span>"
                 ),
-                anchor=(0, 1),
+                anchor=(0.5, 1),
             )
-            label.setPos(left, top)
+            # Putting the text in the horizontal centre keeps a full-band
+            # detection legible instead of hiding its label under the legend.
+            label.setPos((left + right) / 2.0, top)
             self.addItem(label)
             self._signal_box_items.extend((rect, label))
 
@@ -166,6 +191,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._fps_count = 0
         self._fps_last_time = time.monotonic()
         self._last_spectrum: Optional[SpectrumMessage] = None
+        self._last_wide_reference: Optional[SpectrumMessage] = None
 
         self._build_ui()
         self._apply_target_bandwidth_filter()
@@ -219,6 +245,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.chk_maxhold = QtWidgets.QCheckBox("Max Hold")
         self.chk_maxhold.toggled.connect(self.spectrum_view.set_maxhold)
         glyt.addWidget(self.chk_maxhold)
+        self.chk_wide_reference = QtWidgets.QCheckBox("Show C2H0 Coarse Reference")
+        self.chk_wide_reference.setChecked(True)
+        self.chk_wide_reference.toggled.connect(self.spectrum_view.set_wide_reference_visible)
+        glyt.addWidget(self.chk_wide_reference)
         btn_reset_max = QtWidgets.QPushButton("Reset Max Hold")
         btn_reset_max.clicked.connect(self.spectrum_view.reset_maxhold)
         glyt.addWidget(btn_reset_max)
@@ -379,8 +409,22 @@ class MainWindow(QtWidgets.QMainWindow):
             self._refresh_stats()
 
     def _handle_spectrum(self, msg: SpectrumMessage) -> None:
+        # C2H0 is intentionally not sent to the waterfall or the target-box
+        # display.  It is an amber dashed comparison curve for checking the
+        # C2H1 Main/Shift frequency stitching.
+        if isinstance(msg, FPGASpectrumMessage) and msg.target_type == "wide":
+            self._last_wide_reference = msg
+            self.spectrum_view.update_wide_reference(msg.freq_axis_hz, msg.spectrum_db)
+            return
+
         self._last_spectrum = msg
         self._fps_count += 1
+        if self._fps_count <= 3:
+            print(
+                f"[GUI] spectrum rendered: center={msg.center_freq_hz:.0f} Hz, "
+                f"bw={msg.bandwidth_hz:.0f} Hz, points={msg.fft_points}",
+                flush=True,
+            )
 
         freq = msg.freq_axis_hz
         spec = msg.spectrum_db
@@ -392,9 +436,16 @@ class MainWindow(QtWidgets.QMainWindow):
         # 频谱图
         self.spectrum_view.update_spectrum(freq, spec)
         if isinstance(msg, FPGASpectrumMessage):
+            # Broad signals are detected from C2H0 but are intentionally drawn
+            # over C2H1, the only spectrum shown as the primary trace.
+            wide_detected = ()
+            wide_selected = ()
+            if isinstance(self._last_wide_reference, FPGASpectrumMessage):
+                wide_detected = self._last_wide_reference.detected_targets
+                wide_selected = self._last_wide_reference.selected_targets
             self.spectrum_view.set_signal_boxes(
-                msg.detected_targets,
-                msg.selected_targets,
+                tuple(wide_detected) + tuple(msg.detected_targets),
+                tuple(wide_selected) + tuple(msg.selected_targets),
             )
 
         # 瀑布图
