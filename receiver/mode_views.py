@@ -49,10 +49,12 @@ def _turbo_lut(n: int = 256) -> np.ndarray:
 # ============================================================
 
 class SpectrumPlot(pg.PlotWidget):
-    def __init__(self, parent=None, ylabel="Level", yunit="dBµV"):
+    def __init__(self, parent=None, ylabel="电平", yunit="dBµV"):
         super().__init__(parent)
-        self.setLabel("bottom", "Frequency", units="Hz")
+        self.setLabel("bottom", "频率", units="Hz")
         self.setLabel("left", ylabel, units=yunit)
+        self.setMenuEnabled(False)
+        self.hideButtons()
         self.showGrid(x=True, y=True, alpha=GRID_A)
         self.setDownsampling(auto=True, mode="peak")
         self.setClipToView(True)
@@ -100,12 +102,15 @@ class WaterfallPlot(pg.PlotWidget):
     def __init__(self, history_rows=200, display_bins=2048, parent=None,
                  levels=None):
         super().__init__(parent)
-        self.setLabel("bottom", "Frequency", units="Hz")
-        self.setLabel("left", "Time", units="frames")
+        self.setLabel("bottom", "频率", units="Hz")
+        self.setLabel("left", "历史", units="帧")
+        self.setMenuEnabled(False)
+        self.hideButtons()
         self.invertY(True)
         self.history_rows = history_rows
         self.display_bins = display_bins
         lv = levels or self.DEFAULT_LEVELS
+        self._levels = lv
         self._img = np.full((history_rows, display_bins), lv[0], dtype=np.float32)
         self._item = pg.ImageItem(image=self._img, axisOrder="row-major",
                                   autoLevels=False)
@@ -133,7 +138,8 @@ class WaterfallPlot(pg.PlotWidget):
         self.setXRange(start_hz, stop_hz, padding=0)
 
     def set_levels(self, low, high):
-        self._item.setLevels((low, high))
+        self._levels = (low, high)
+        self._item.setLevels(self._levels)
 
     def push_row(self, spec_db):
         row = self._downsample(spec_db, self.display_bins)
@@ -141,8 +147,8 @@ class WaterfallPlot(pg.PlotWidget):
         self._img[0] = row
         self._item.setImage(self._img, autoLevels=False)
 
-    def clear(self):
-        self._img.fill(self.DEFAULT_LEVELS[0])
+    def clear_history(self):
+        self._img.fill(self._levels[0])
         self._item.setImage(self._img, autoLevels=False)
 
     @staticmethod
@@ -168,8 +174,10 @@ class WaterfallPlot(pg.PlotWidget):
 class ScanPlot(pg.PlotWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setLabel("bottom", "Frequency", units="Hz")
+        self.setLabel("bottom", "频率", units="Hz")
         self.setLabel("left", "Level", units="dBµV")
+        self.setMenuEnabled(False)
+        self.hideButtons()
         self.showGrid(x=True, y=True, alpha=GRID_A)
         self.setDownsampling(auto=True, mode="peak")
         self.setClipToView(True)
@@ -187,8 +195,10 @@ class ScanPlot(pg.PlotWidget):
 class FastScanPlot(pg.PlotWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setLabel("bottom", "Frequency", units="Hz")
+        self.setLabel("bottom", "频率", units="Hz")
         self.setLabel("left", "Level", units="dBµV")
+        self.setMenuEnabled(False)
+        self.hideButtons()
         self.showGrid(x=True, y=True, alpha=GRID_A)
         self.noise = self.plot(pen=pg.mkPen(ORANGE, width=1.0,
                                             style=QtCore.Qt.PenStyle.DashLine))

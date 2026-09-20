@@ -10,46 +10,8 @@ from __future__ import annotations
 from PyQt6 import QtCore, QtWidgets
 
 from .rx_config import RxConfig
-
-
-DIALOG_STYLE = """
-QDialog { background: #0e1116; color: #d0d8e0; }
-QLabel { color: #d0d8e0; }
-QLineEdit {
-    background: #141923; border: 1px solid #2a3140; padding: 4px 6px;
-    border-radius: 2px; color: #d0d8e0;
-}
-QSpinBox {
-    background: #141923; border: 1px solid #2a3140;
-    padding: 4px 18px 4px 6px; border-radius: 2px; color: #d0d8e0;
-}
-QSpinBox::up-button {
-    subcontrol-origin: border; subcontrol-position: top right;
-    width: 16px; border-left: 1px solid #2a3140; background: #1c2330;
-}
-QSpinBox::down-button {
-    subcontrol-origin: border; subcontrol-position: bottom right;
-    width: 16px; border-left: 1px solid #2a3140; background: #1c2330;
-}
-QSpinBox::up-button:hover, QSpinBox::down-button:hover { background: #2a3447; }
-QSpinBox::up-arrow {
-    image: none; width: 0; height: 0;
-    border-left: 4px solid transparent; border-right: 4px solid transparent;
-    border-bottom: 6px solid #9fb0c0;
-}
-QSpinBox::down-arrow {
-    image: none; width: 0; height: 0;
-    border-left: 4px solid transparent; border-right: 4px solid transparent;
-    border-top: 6px solid #9fb0c0;
-}
-QPushButton {
-    background: #1c2330; border: 1px solid #2e3a4f;
-    padding: 6px 16px; border-radius: 3px; color: #d0d8e0;
-}
-QPushButton:hover { background: #2a3447; }
-QPushButton#primary { background: #00d4ff; color: #001018; font-weight: bold; }
-QPushButton#primary:hover { background: #38e0ff; }
-"""
+from .inputs import NumberInput
+from .theme import APP_STYLE
 
 
 class ReceiverConfigDialog(QtWidgets.QDialog):
@@ -63,7 +25,7 @@ class ReceiverConfigDialog(QtWidgets.QDialog):
         self.setWindowTitle("接收机配置")
         self.setModal(True)
         self.setMinimumWidth(360)
-        self.setStyleSheet(DIALOG_STYLE)
+        self.setStyleSheet(APP_STYLE)
 
         self.cfg = cfg or RxConfig.load()
 
@@ -74,9 +36,7 @@ class ReceiverConfigDialog(QtWidgets.QDialog):
 
         self.ed_rx_ip = QtWidgets.QLineEdit(self.cfg.receiver_ip)
         self.ed_local_ip = QtWidgets.QLineEdit(self.cfg.local_ip)
-        self.sp_port = QtWidgets.QSpinBox()
-        self.sp_port.setRange(1, 65535)
-        self.sp_port.setValue(self.cfg.tcp_port)
+        self.sp_port = NumberInput(1, 65535, self.cfg.tcp_port, name="控制端口", decimals=0)
 
         # IP 输入校验 (简单点分四段)
         ip_re = QtCore.QRegularExpression(
@@ -112,12 +72,17 @@ class ReceiverConfigDialog(QtWidgets.QDialog):
     def _on_ok(self):
         rx = self.ed_rx_ip.text().strip()
         local = self.ed_local_ip.text().strip()
-        if not rx or not local:
+        if not self.ed_rx_ip.hasAcceptableInput() or not self.ed_local_ip.hasAcceptableInput():
             QtWidgets.QMessageBox.warning(self, "配置无效", "请填写完整的 IP 地址")
+            return
+        try:
+            port = self.sp_port.value()
+        except ValueError as error:
+            QtWidgets.QMessageBox.warning(self, "配置无效", str(error))
             return
         self.cfg.receiver_ip = rx
         self.cfg.local_ip = local
-        self.cfg.tcp_port = self.sp_port.value()
+        self.cfg.tcp_port = port
         self.cfg.save()
         self.accept()
 

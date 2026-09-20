@@ -394,10 +394,12 @@ class StreamPacketReader:
 class EnergyDetector:
     """Low-SNR detector with bandwidth-adaptive protection and smoothing.
 
-    The running power average avoids dropping weak edge bins on one FFT frame;
-    the protection band is calculated in Hz from the measured occupied
-    bandwidth, then converted to the current spectrum's bin spacing.  This
-    keeps the physical margin consistent between C2H0 and C2H1.
+    The running power average avoids dropping weak edge bins on one FFT frame.
+    Noise is estimated in dB from the lowest-power population, not from a
+    linear-power percentile: a mostly occupied wideband signal would otherwise
+    incorrectly raise its own signal plateau to the reported noise floor.
+    The protection band is calculated in Hz from the measured occupied
+    bandwidth, then converted to the current spectrum's bin spacing.
     """
 
     def __init__(
@@ -409,6 +411,8 @@ class EnergyDetector:
         merge_gap_hz: float = 12_500.0,
         min_bins: int = 2,
         smoothing: float = 0.65,
+        occupied_bandwidth_percent: float = 0.99,
+        wide_min_bandwidth_hz: float = 1_000_000.0,
     ):
         if (
             snr_db <= 0
@@ -417,6 +421,8 @@ class EnergyDetector:
             or max_guard_hz < min_guard_hz
             or merge_gap_hz < 0
             or min_bins < 1
+            or not 0.5 < occupied_bandwidth_percent < 1.0
+            or wide_min_bandwidth_hz <= 0
         ):
             raise ValueError("invalid energy-detector configuration")
         if not 0.0 <= smoothing < 1.0:
@@ -428,6 +434,8 @@ class EnergyDetector:
         self.merge_gap_hz = merge_gap_hz
         self.min_bins = min_bins
         self.smoothing = smoothing
+        self.occupied_bandwidth_percent = occupied_bandwidth_percent
+        self.wide_min_bandwidth_hz = wide_min_bandwidth_hz
         self._smoothed: dict[object, np.ndarray] = {}
         self._settings_lock = threading.Lock()
 
@@ -438,6 +446,47 @@ class EnergyDetector:
         with self._settings_lock:
             self.snr_db = float(snr_db)
 
+    @staticmethod
+    def estimate_noise_floor_db(
+        values: np.ndarray,
+        noise_fraction: float = 0.15,
+        *,
+        exclude_filter_stopband: bool = False,
+    ) -> float:
+        """Estimate noise in dB, optionally excluding a filter stopband.
+
+        Wideband captures often have a deep digital-filter stopband outside
+        the usable analysis band.  That floor (for example -70 dB) is not the
+        in-band noise platform (about -16 dB in the 300 MHz test capture), so
+        wide detection first selects its largest contiguous passband within
+        30 dB of the maximum and takes its 20th-percentile level.  Narrowband
+        detection retains the quietest-population estimator.
+        """
+        if not 0.0 < noise_fraction <= 0.5:
+            raise ValueError("noise_fraction must be in (0, 0.5]")
+        db = 10.0 * np.log10(np.maximum(values.astype(np.float64), np.finfo(np.float64).tiny))
+        if not exclude_filter_stopband:
+            cutoff = float(np.quantile(db, noise_fraction))
+            quiet = db[db <= cutoff]
+            return float(np.median(quiet))
+
+        relative_db = db - float(db.max())
+        candidate = np.flatnonzero(relative_db >= -30.0)
+        if not candidate.size:
+            return float(np.percentile(db, 20.0))
+        groups: list[tuple[int, int]] = []
+        start = last = int(candidate[0])
+        for index in candidate[1:]:
+            index = int(index)
+            if index == last + 1:
+                last = index
+            else:
+                groups.append((start, last))
+                start = last = index
+        groups.append((start, last))
+        start, last = max(groups, key=lambda item: item[1] - item[0])
+        return float(np.percentile(db[start:last + 1], 20.0))
+
     def detect(self, power: np.ndarray, center_hz: float, bandwidth_hz: float, target_type: str, max_targets: int, stream_id: object = None) -> list[Target]:
         values = power.astype(np.float64)
         if stream_id is not None:
@@ -447,9 +496,14 @@ class EnergyDetector:
             self._smoothed[stream_id] = values.copy()
         with self._settings_lock:
             snr_db = self.snr_db
-        floor = float(np.percentile(values, 35.0))
-        threshold = floor * 10.0 ** (snr_db / 10.0)
-        active = values >= threshold
+        if target_type == "wide":
+            return self._detect_wide_obw(values, center_hz, bandwidth_hz, max_targets)
+        noise_floor_db = self.estimate_noise_floor_db(
+            values,
+            exclude_filter_stopband=False,
+        )
+        levels_db = 10.0 * np.log10(np.maximum(values, np.finfo(np.float64).tiny))
+        active = levels_db >= noise_floor_db + snr_db
         if not np.any(active):
             return []
         bin_hz = bandwidth_hz / len(values)
@@ -483,6 +537,75 @@ class EnergyDetector:
             freq = int(round(frequency))
             if -BASEBAND_LIMIT_HZ <= freq < BASEBAND_LIMIT_HZ:
                 targets.append(Target(target_type, sequence, freq, int(round(width)), int(round(bandwidth_hz))))
+        return targets
+
+    def _detect_wide_obw(
+        self,
+        values: np.ndarray,
+        center_hz: float,
+        bandwidth_hz: float,
+        max_targets: int,
+    ) -> list[Target]:
+        """Find wide emissions by filter-aware 99% occupied bandwidth.
+
+        This mirrors the measurement approach used by spectrum analysers:
+        select the usable passband first, then find the two frequencies that
+        leave equal residual integrated power outside the requested OBW.
+        A threshold crossing is intentionally not used to define wide-signal
+        bandwidth because modulation ripple would fragment one emission.
+        """
+        if max_targets < 1:
+            return []
+        levels_db = 10.0 * np.log10(np.maximum(values, np.finfo(np.float64).tiny))
+        relative_db = levels_db - float(levels_db.max())
+        indices = np.flatnonzero(relative_db >= -30.0)
+        if not indices.size:
+            return []
+        groups: list[tuple[int, int]] = []
+        start = last = int(indices[0])
+        for index in indices[1:]:
+            index = int(index)
+            if index == last + 1:
+                last = index
+            else:
+                groups.append((start, last))
+                start = last = index
+        groups.append((start, last))
+
+        bin_hz = bandwidth_hz / len(values)
+        candidates: list[tuple[float, float, float]] = []
+        for start, stop in groups:
+            if (
+                stop - start + 1 < self.min_bins
+                or (stop - start + 1) * bin_hz < self.wide_min_bandwidth_hz
+            ):
+                continue
+            band_power = values[start:stop + 1]
+            total_power = float(band_power.sum())
+            if total_power <= 0.0:
+                continue
+            cumulative = np.cumsum(band_power, dtype=np.float64)
+            tail_power = (1.0 - self.occupied_bandwidth_percent) * total_power / 2.0
+            left = start + int(np.searchsorted(cumulative, tail_power, side="left"))
+            right = start + int(np.searchsorted(cumulative, total_power - tail_power, side="left"))
+            right = min(right, stop)
+            occupied_hz = max(bin_hz, (right - left + 1) * bin_hz)
+            guard_hz = min(
+                self.max_guard_hz,
+                max(self.min_guard_hz, occupied_hz * self.relative_guard),
+            )
+            left = max(0, left - int(np.ceil(guard_hz / bin_hz)))
+            right = min(len(values) - 1, right + int(np.ceil(guard_hz / bin_hz)))
+            frequency = center_hz - bandwidth_hz / 2.0 + (left + right + 1) * bin_hz / 2.0
+            width = max(bin_hz, (right - left + 1) * bin_hz)
+            candidates.append((total_power, frequency, width))
+
+        candidates.sort(reverse=True, key=lambda item: item[0])
+        targets = []
+        for sequence, (_, frequency, width) in enumerate(candidates[:max_targets]):
+            freq = int(round(frequency))
+            if -BASEBAND_LIMIT_HZ <= freq < BASEBAND_LIMIT_HZ:
+                targets.append(Target("wide", sequence, freq, int(round(width)), int(round(bandwidth_hz))))
         return targets
 
 

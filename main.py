@@ -181,7 +181,7 @@ class SpectrumView(pg.PlotWidget):
 # 主窗口
 # ============================================================
 
-class MainWindow(QtWidgets.QMainWindow):
+class FPGAMainWindow(QtWidgets.QMainWindow):
     def __init__(self, source: DataSource):
         super().__init__()
         self.setWindowTitle("FPGA Spectrum Analyzer")
@@ -529,31 +529,17 @@ class MainWindow(QtWidgets.QMainWindow):
         super().closeEvent(event)
 
 
+# 默认入口直接使用接收机 FFM 页面，不启动旧 FPGA 采集流程。
+from receiver.integrate import _StandaloneWindow
+
+
+class MainWindow(_StandaloneWindow):
+    pass
+
+
 def main():
-    import argparse
-    parser = argparse.ArgumentParser(
-        description="FPGA spectrum detection, target selection, and DDC IQ capture"
-    )
-    parser.add_argument("--detect-min-guard-hz", type=float, default=25e3,
-                        help="检测最小单侧保护带宽(Hz)，默认25 kHz")
-    parser.add_argument("--detect-relative-guard", type=float, default=0.10,
-                        help="单侧保护带占检测带宽的比例，默认10%%")
-    parser.add_argument("--detect-max-guard-hz", type=float, default=2e6,
-                        help="单侧保护带宽上限(Hz)，默认2 MHz")
-    args = parser.parse_args()
-
-    # This application has one hardware workflow and owns C2H0..C2H3.
-    source = SpectrumDDCClosedLoop(
-        detector=EnergyDetector(
-            min_guard_hz=args.detect_min_guard_hz,
-            relative_guard=args.detect_relative_guard,
-            max_guard_hz=args.detect_max_guard_hz,
-        ),
-        target_filter=TargetFilter(),
-    )
-
     app = QtWidgets.QApplication(sys.argv)
-    win = MainWindow(source)
+    win = MainWindow()
     win.show()
     sys.exit(app.exec())
 

@@ -16,7 +16,13 @@ from __future__ import annotations
 
 from PyQt6 import QtCore, QtWidgets
 
+import math
+import numpy as np
+
 from .controller import ReceiverController, RxMode
+from .ffm_spectrum import FFMSpectrumPlot, TraceProcessor
+from .inputs import NumberInput, NoWheelComboBox
+from .theme import APP_STYLE
 from .mode_panels import (
     FFMPanel, PScanPanel, FScanPanel, MScanPanel, DDCPanel,
 )
@@ -28,75 +34,7 @@ from .rx_protocol import (
 )
 
 
-PAGE_STYLE = """
-QWidget { background: #0e1116; color: #d0d8e0; }
-QGroupBox {
-    border: 1px solid #2a3140; border-radius: 4px;
-    margin-top: 10px; padding-top: 6px; font-weight: bold;
-}
-QGroupBox::title { subcontrol-origin: margin; left: 8px; padding: 0 4px; }
-QPushButton {
-    background: #1c2330; border: 1px solid #2e3a4f;
-    padding: 6px 10px; border-radius: 3px;
-}
-QPushButton:hover { background: #2a3447; }
-QPushButton:pressed { background: #00d4ff; color: #000; }
-QPushButton:disabled { color: #555; border-color: #222; }
-QPushButton#primary { background: #00d4ff; color: #001018; font-weight: bold; }
-QPushButton#danger { background: #3a1c22; border-color: #5a2a33; }
-QLineEdit, QComboBox {
-    background: #141923; border: 1px solid #334155; padding: 4px 30px 4px 7px;
-    border-radius: 2px;
-}
-QComboBox::drop-down {
-    subcontrol-origin: padding; subcontrol-position: top right;
-    width: 24px; border-left: 1px solid #334155; background: #202b3b;
-}
-QComboBox::down-arrow {
-    width: 0; height: 0; border-left: 5px solid transparent;
-    border-right: 5px solid transparent; border-top: 6px solid #9fb0c0;
-}
-QComboBox QAbstractItemView {
-    background: #141923; border: 1px solid #3b4b63;
-    selection-background-color: #00a8cc; selection-color: #001018;
-}
-QSpinBox, QDoubleSpinBox {
-    background: #141923; border: 1px solid #334155;
-    border-radius: 2px;
-    padding: 4px 26px 4px 7px;
-}
-QSpinBox::up-button, QDoubleSpinBox::up-button {
-    subcontrol-origin: border; subcontrol-position: top right;
-    width: 22px; border-left: 1px solid #334155;
-    border-top-right-radius: 2px; background: #202b3b;
-}
-QSpinBox::down-button, QDoubleSpinBox::down-button {
-    subcontrol-origin: border; subcontrol-position: bottom right;
-    width: 22px; border-left: 1px solid #334155;
-    border-bottom-right-radius: 2px; background: #202b3b;
-}
-QSpinBox::up-button:hover, QDoubleSpinBox::up-button:hover,
-QSpinBox::down-button:hover, QDoubleSpinBox::down-button:hover {
-    background: #31445f;
-}
-QSpinBox::up-button:pressed, QDoubleSpinBox::up-button:pressed,
-QSpinBox::down-button:pressed, QDoubleSpinBox::down-button:pressed {
-    background: #00a8cc;
-}
-QSpinBox::up-arrow, QDoubleSpinBox::up-arrow {
-    image: none; width: 0; height: 0;
-    border-left: 5px solid transparent; border-right: 5px solid transparent;
-    border-bottom: 6px solid #c8d5e3;
-}
-QSpinBox::down-arrow, QDoubleSpinBox::down-arrow {
-    image: none; width: 0; height: 0;
-    border-left: 5px solid transparent; border-right: 5px solid transparent;
-    border-top: 6px solid #c8d5e3;
-}
-QTableWidget { background: #141923; gridline-color: #2a3140; }
-QHeaderView::section { background: #1c2330; padding: 4px; border: none; }
-QLabel#pageTitle { font-size: 15px; font-weight: bold; color: #00d4ff; }
-"""
+PAGE_STYLE = APP_STYLE
 
 
 class _BasePage(QtWidgets.QWidget):
@@ -108,6 +46,7 @@ class _BasePage(QtWidgets.QWidget):
     def __init__(self, controller: ReceiverController, parent=None):
         super().__init__(parent)
         self.controller = controller
+        self.setObjectName("receiverPage")
         self.setStyleSheet(PAGE_STYLE)
 
         root = QtWidgets.QVBoxLayout(self)
@@ -116,9 +55,10 @@ class _BasePage(QtWidgets.QWidget):
 
         # 顶部: 标题 + 动作
         top = QtWidgets.QHBoxLayout()
-        lbl = QtWidgets.QLabel("▶ " + self.title)
-        lbl.setObjectName("pageTitle")
-        top.addWidget(lbl)
+        if self.title:
+            lbl = QtWidgets.QLabel(self.title)
+            lbl.setObjectName("pageTitle")
+            top.addWidget(lbl)
         top.addStretch(1)
         self.btn_apply = QtWidgets.QPushButton("应用配置")
         self.btn_start = QtWidgets.QPushButton("开始")
@@ -137,19 +77,22 @@ class _BasePage(QtWidgets.QWidget):
 
         right = QtWidgets.QScrollArea()
         right.setWidgetResizable(True)
+        right.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         right.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
-        right.setMinimumWidth(410)
-        right.setMaximumWidth(480)
+        right.setMinimumWidth(290)
+        right.setMaximumWidth(440)
         self.panel = self._build_panel()
         right.setWidget(self.panel)
         split.addWidget(right)
         split.setStretchFactor(0, 4)
         split.setStretchFactor(1, 1)
-        split.setSizes([1000, 430])
+        split.setSizes([1060, 330])
+        split.setCollapsible(0, False)
+        split.setCollapsible(1, False)
         root.addWidget(split, 1)
 
         self.btn_apply.clicked.connect(self._on_apply)
-        self.btn_start.clicked.connect(self.controller.start)
+        self.btn_start.clicked.connect(self._on_start)
         self.btn_stop.clicked.connect(self.controller.stop)
 
         self._connect_signals()
@@ -170,10 +113,15 @@ class _BasePage(QtWidgets.QWidget):
     def _on_apply(self):
         self.controller.apply_mode(self.apply_mode(), self.get_config())
 
+    def _on_start(self):
+        applied = self._on_apply()
+        if applied is not False and self.controller.is_connected():
+            self.controller.start()
+
     def set_enabled_actions(self, connected: bool):
         self.btn_apply.setEnabled(connected)
         self.btn_start.setEnabled(connected)
-        self.btn_stop.setEnabled(connected)
+        self.btn_stop.setEnabled(False)
 
 
 # ============================================================
@@ -182,21 +130,55 @@ class _BasePage(QtWidgets.QWidget):
 
 class FFMPage(_BasePage):
     mode = RxMode.FFM
-    title = "FFM 固定频点监测"
+    title = ""
 
     def _build_display(self):
         w = QtWidgets.QWidget()
-        v = QtWidgets.QVBoxLayout(w)
-        v.setContentsMargins(0, 0, 0, 0)
+        layout = QtWidgets.QVBoxLayout(w)
+        layout.setContentsMargins(0, 0, 0, 0)
+        toolbar = QtWidgets.QHBoxLayout()
+        toolbar.addWidget(QtWidgets.QLabel("迹线"))
+        self.trace_mode = NoWheelComboBox()
+        self.trace_mode.addItems(TraceProcessor.MODES)
+        self.trace_mode.setFixedWidth(128)
+        toolbar.addWidget(self.trace_mode)
+        self.average_label = QtWidgets.QLabel("平均次数")
+        self.average_count = NumberInput(2, 100, 10, name="平均次数", decimals=0)
+        self.average_count.setMaximumWidth(75)
+        self.average_count.setToolTip("最近 N 帧在线性功率域平均")
+        toolbar.addWidget(self.average_label)
+        toolbar.addWidget(self.average_count)
+        self.average_label.hide()
+        self.average_count.hide()
+        toolbar.addStretch()
+        self.auto_adjust = QtWidgets.QPushButton("自动调整")
+        self.auto_adjust.setToolTip("恢复完整频率范围，并按当前频谱自动设置电平刻度")
+        toolbar.addWidget(self.auto_adjust)
+        for text, step in (("↑", 1), ("↓", -1)):
+            button = QtWidgets.QToolButton()
+            button.setText(text)
+            button.setToolTip("参考电平上调一格" if step > 0 else "参考电平下调一格")
+            button.clicked.connect(lambda _checked=False, direction=step: self._shift_reference(direction))
+            toolbar.addWidget(button)
+        layout.addLayout(toolbar)
+
         split = QtWidgets.QSplitter(QtCore.Qt.Orientation.Vertical)
-        self.spectrum = SpectrumPlot()
+        self.spectrum = FFMSpectrumPlot()
         self.waterfall = WaterfallPlot(history_rows=200, display_bins=2048)
-        self.spectrum.setXLink(self.waterfall)
+        self.waterfall.setBackground("#050a11")
+        self.waterfall.getAxis("left").setWidth(72)
+        self.waterfall.setXLink(self.spectrum)
         split.addWidget(self.spectrum)
         split.addWidget(self.waterfall)
+        split.setCollapsible(0, False)
+        split.setCollapsible(1, False)
         split.setStretchFactor(0, 3)
-        split.setStretchFactor(1, 4)
-        v.addWidget(split)
+        split.setStretchFactor(1, 2)
+        split.setSizes([450, 300])
+        layout.addWidget(split, 1)
+        self.trace_mode.currentTextChanged.connect(self._trace_mode_changed)
+        self.average_count.editingFinished.connect(self._average_changed)
+        self.auto_adjust.clicked.connect(self._auto_adjust)
         return w
 
     def _build_panel(self):
@@ -204,47 +186,117 @@ class FFMPage(_BasePage):
 
     def _connect_signals(self):
         self.controller.spectrumReady.connect(self._on_spectrum)
+        self.controller.connectedChanged.connect(self._connection_changed)
         self._last_ffm_update_ms = 0
+        self._refresh_ms = 100
         self._spectrum_stitcher = SpectrumStitcher()
-        # 首包频谱到达前，也使用右侧面板的默认配置显示坐标。
         self._apply_display_axes(self.get_config())
+        self.waterfall.clear_history()
+        for editor in (self.panel.ref, self.panel.lvspan):
+            editor.editingFinished.connect(self._update_level_scale)
+        self.panel.dpx_refresh.editingFinished.connect(self._update_refresh)
+
+    def _connection_changed(self, _connected):
+        self.spectrum.clear_trace()
+        self.waterfall.clear_history()
+        self._spectrum_stitcher.configure(*self._configured_band)
+        self._last_ffm_update_ms = 0
+
+    def _trace_mode_changed(self, mode):
+        self.spectrum.set_trace_mode(mode)
+        self.average_label.setVisible(mode == "平均")
+        self.average_count.setVisible(mode == "平均")
+
+    def _average_changed(self):
+        try:
+            self.spectrum.set_average_count(self.average_count.value())
+        except ValueError as error:
+            QtWidgets.QMessageBox.warning(self, "参数无效", str(error))
+
+    def _update_refresh(self):
+        try:
+            self._refresh_ms = self.panel.dpx_refresh.value()
+        except ValueError as error:
+            QtWidgets.QMessageBox.warning(self, "参数无效", str(error))
+
+    def _update_level_scale(self):
+        try:
+            reference, spacing, divisions = self.panel.display_scale()
+        except ValueError as error:
+            QtWidgets.QMessageBox.warning(self, "参数无效", str(error))
+            return False
+        self.spectrum.set_reference_scale(reference, spacing, divisions)
+        self.waterfall.set_levels(reference - spacing * divisions, reference)
+        return True
+
+    def _shift_reference(self, direction):
+        try:
+            reference, spacing, _ = self.panel.display_scale()
+            reference = min(self.panel.ref.maximum, max(self.panel.ref.minimum, reference + direction * spacing))
+            self.panel.ref.setValue(reference)
+            self._update_level_scale()
+        except ValueError as error:
+            QtWidgets.QMessageBox.warning(self, "参数无效", str(error))
+
+    def _auto_adjust(self):
+        self.spectrum.reset_view()
+        values = self.spectrum.values
+        values = values[np.isfinite(values)]
+        if values.size < 3:
+            self._update_level_scale()
+            return
+        lower10, lower30 = np.percentile(values, (10, 30))
+        noise = float(lower30 + .7 * (lower30 - lower10))
+        peak = float(np.max(values))
+        required = (peak - noise + max(5, (peak - noise) * .1)) / 6
+        spacing = next((x for x in (1, 2, 5, 10, 20, 50) if x >= required), 50)
+        reference = min(self.panel.ref.maximum, max(self.panel.ref.minimum, math.ceil(noise + 6 * spacing)))
+        self.panel.ref.setValue(reference)
+        self.panel.lvspan.setValue(spacing)
+        self._update_level_scale()
 
     def _apply_display_axes(self, config):
-        """按 FFM 配置同步频谱和瀑布图的横纵坐标。"""
-        center_hz = (config.center_mhz * 1_000_000
-                     + config.offset_khz * 1_000)
-        half_span_hz = config.span_khz * 1_000 / 2
-        start_hz = center_hz - half_span_hz
-        stop_hz = center_hz + half_span_hz
-        low_dbuv = config.ref_level_dbuv - config.level_span_db * 10
-
-        self.spectrum.enableAutoRange(axis="x", enable=False)
-        self.spectrum.enableAutoRange(axis="y", enable=False)
-        self.spectrum.setXRange(start_hz, stop_hz, padding=0)
-        self.spectrum.set_reference_scale(config.ref_level_dbuv,
-                                          config.level_span_db)
-        self.waterfall.set_freq_range(start_hz, stop_hz)
-        self.waterfall.set_levels(low_dbuv, config.ref_level_dbuv)
-        self._spectrum_stitcher.configure(center_hz, config.span_khz * 1_000)
+        center = config.center_mhz * 1e6
+        span = config.span_khz * 1e3
+        # 零跨距仍按 0 下发；坐标保留 1 Hz 的最小显示范围，避免除零。
+        display_span = max(1.0, span)
+        start, stop = center - display_span / 2, center + display_span / 2
+        self.waterfall.set_freq_range(start, stop)
+        self.waterfall.setLimits(xMin=start, xMax=stop, minXRange=max(1, display_span / 16384), maxXRange=display_span)
+        self.spectrum.set_frequency_range(start, stop)
+        self._update_level_scale()
+        self._configured_band = (center, span)
+        self._spectrum_stitcher.configure(center, span)
 
     def _on_apply(self):
-        config = self.get_config()
+        try:
+            config = self.get_config()
+        except ValueError as error:
+            QtWidgets.QMessageBox.warning(self, "参数无效", str(error))
+            return False
         self._apply_display_axes(config)
-        self.controller.apply_mode(self.apply_mode(), config)
+        self.spectrum.clear_trace()
+        self.waterfall.clear_history()
+        self._spectrum_stitcher.configure(*self._configured_band)
+        self._last_ffm_update_ms = 0
+        self._refresh_ms = config.dpx_refresh_ms
+        self.controller.apply_mode(self.mode, config)
+        return True
 
     @QtCore.pyqtSlot(object)
-    def _on_spectrum(self, d: SpectrumData):
-        if self.controller.current_mode != RxMode.FFM:
+    def _on_spectrum(self, data: SpectrumData):
+        if self.controller.current_mode != self.mode:
             return
-        complete = self._spectrum_stitcher.add(d)
+        complete = self._spectrum_stitcher.add(data)
         if complete is None:
             return
-        # DPX 刷新时间控制本地曲线/瀑布重绘速率，不丢弃接收机数据链路。
-        now_ms = QtCore.QDateTime.currentMSecsSinceEpoch()
-        if now_ms - self._last_ffm_update_ms < self.panel.dpx_refresh.value():
+        # Process every completed frame so peaks/averages survive display throttling.
+        self.spectrum.update_spectrum(complete.freq_axis_hz, complete.levels_db, render=False)
+        now = QtCore.QDateTime.currentMSecsSinceEpoch()
+        if now - self._last_ffm_update_ms < self._refresh_ms:
             return
-        self._last_ffm_update_ms = now_ms
-        self.spectrum.update_spectrum(complete.freq_axis_hz, complete.levels_db)
+        self._last_ffm_update_ms = now
+        self.spectrum.render_trace()
         self.waterfall.push_row(complete.levels_db)
 
 

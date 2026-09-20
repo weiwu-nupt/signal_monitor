@@ -148,6 +148,16 @@ def meas_time(ms: float) -> str:
 def meas_time_auto(on: bool) -> str:
     return f"MEASure:TIME:AUTomation {'ON' if on else 'OFF'}"
 
+
+def bandwidth_xdb(value: float) -> str:
+    """ITU XdB parameter, SCPI 2.2.22; valid range 0..100 dB."""
+    return f"MEASure:BANDwidth:XDB {value}"
+
+
+def bandwidth_beta(value: float) -> str:
+    """ITU beta parameter; this application accepts 0 per user configuration."""
+    return f"MEASure:BANDwidth:BETA {value}"
+
 def detector(mode: str) -> str:
     """FAST|POSitive|AVERage|RMS"""
     return f"MEASure:DETector {mode}"

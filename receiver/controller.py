@@ -22,6 +22,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
+import math
 from typing import List, Optional
 
 from PyQt6 import QtCore
@@ -55,33 +56,45 @@ class RxMode(Enum):
 class FFMConfig:
     # 射频控制参数
     center_mhz: float = 2000.0
-    span_khz: float = 20000.0
-    step_khz: float = 6.25
-    offset_khz: float = 0.0
+    span_khz: float = 409600.0
+    step_khz: float = 12.5
     bandwidth_khz: float = 500.0
-    ref_clock: str = "0"
     ref_level_dbuv: float = 120.0
     level_span_db: float = 20.0
     xdb_band_db: float = 26.0
     beta_band_pct: float = 0.0
     demod: str = "FM"
     squelch_on: bool = False
-    threshold_dbuv: float = 50.0
-    level_trigger_on: bool = False
-    level_trigger_dbuv: float = 0.0
     att_auto: bool = False
     if_att_db: float = 0.0
     rf_att_db: float = 0.0
     rf_mode: str = "NORMal"
-    rf_mode_2: str = "NORMal"
-    rf_output_mode: str = "低速"
-    high_performance: bool = False
     measure_time_us: int = 500
     detector: str = "POSitive"
-    # DPX/占用率为上位机显示参数；当前接收机 SCPI 手册未定义对应命令。
+    # 本地显示刷新间隔。
     dpx_refresh_ms: int = 100
-    echo_speed: int = 1
-    red_occupancy_pct: float = 1.0
+
+    def validate(self):
+        """Device bounds from SCPI 2.2; validate before stopping/reconfiguring hardware."""
+        bounds = (
+            ("中心频率（MHz）", self.center_mhz, 0, 8000),
+            ("频谱带宽（kHz）", self.span_khz, 0, 8_000_000),
+            ("解调带宽（kHz）", self.bandwidth_khz, 1.5, 500),
+            ("参考电平（dBµV）", self.ref_level_dbuv, -256, 256),
+            ("电平跨度（dB/格）", self.level_span_db, 1, 50),
+            ("XdB 带宽（dB）", self.xdb_band_db, 0, 100),
+            ("β% 带宽（%）", self.beta_band_pct, 0, 99.9),
+            ("射频衰减（dB）", self.rf_att_db, 0, 50),
+            ("中频衰减（dB）", self.if_att_db, 0, 50),
+            ("测量时间（µs）", self.measure_time_us, 0, 10_000_000),
+        )
+        for label, value, low, high in bounds:
+            if not math.isfinite(value) or not low <= value <= high:
+                raise ValueError(f"{label}范围为 {low:g}～{high:g}")
+        if self.step_khz not in (12.5, 25, 50, 100, 200):
+            raise ValueError("频谱步进仅支持 12.5、25、50、100、200 kHz")
+        if self.span_khz > 0 and self.bandwidth_khz > self.span_khz:
+            raise ValueError("解调带宽不能大于频谱带宽")
 
 
 @dataclass
@@ -227,6 +240,12 @@ class ReceiverController(QtCore.QObject):
     # -------- 模式下发 --------
 
     def apply_mode(self, mode: RxMode, config) -> None:
+        if mode == RxMode.FFM:
+            try:
+                config.validate()
+            except ValueError as error:
+                self.errorOccurred.emit(str(error))
+                return
         if not self.is_connected():
             self.errorOccurred.emit("未连接接收机, 无法切换模式")
             return
@@ -255,26 +274,27 @@ class ReceiverController(QtCore.QObject):
 
         self._mode = mode
         self.modeChanged.emit(mode)
-        self.statusMessage.emit(f"已切换到 {mode.value} 模式")
+        self.statusMessage.emit("已应用接收机配置" if mode == RxMode.FFM else f"已切换到 {mode.value} 模式")
 
     def _udp(self, port: int, channel: str) -> str:
         return scpi.trace_udp(self._local_ip, port, channel)
 
     # ---- FFM ----
     def _apply_ffm(self, c: FFMConfig) -> None:
+        c.validate()
         cmds = [
             scpi.freq_mode(scpi.MODE_FIXED),
             scpi.freq_center(c.center_mhz),
             scpi.freq_span(c.span_khz),
-            scpi.freq_step(c.step_khz),
-            scpi.freq_offset(c.offset_khz),
             scpi.bandwidth(c.bandwidth_khz),
             scpi.demodulation(c.demod),
             scpi.detector(c.detector),
             scpi.att_auto(c.att_auto),
             scpi.squelch(c.squelch_on),
-            scpi.threshold(c.threshold_dbuv),
+            scpi.meas_time_auto(False),
             scpi.meas_time(c.measure_time_us / 1000.0),
+            scpi.bandwidth_xdb(c.xdb_band_db),
+            scpi.bandwidth_beta(c.beta_band_pct),
             self._udp(8000, "MEAS"),
             self._udp(8004, "IF"),
             # IQ 不属于 TRAC:MED；注册 IF 通道后由 8004 输出。
