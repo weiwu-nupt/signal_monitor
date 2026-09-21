@@ -120,7 +120,7 @@ class FFMPanel(QtWidgets.QWidget):
         self.center = field(frequency, "中心频率", FrequencyInput(
             2_000_000_000, minimum_hz=0, maximum_hz=8_000_000_000, field_name="中心频率"))
         self.span = field(frequency, "频谱带宽", FrequencyInput(
-            409_600_000, minimum_hz=0, maximum_hz=8_000_000_000, field_name="频谱带宽"))
+            320_000_000, minimum_hz=0, maximum_hz=320_000_000, field_name="频谱带宽"))
         self.step = combo(frequency, "频谱步进", [(f"{x} kHz", float(x)) for x in FFM_STEPS_KHZ], 12.5)
 
         self.ref = number(level, "参考电平（dBµV）", -256, 256, 120, 1)

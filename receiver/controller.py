@@ -56,7 +56,7 @@ class RxMode(Enum):
 class FFMConfig:
     # 射频控制参数
     center_mhz: float = 2000.0
-    span_khz: float = 409600.0
+    span_khz: float = 320000.0
     step_khz: float = 12.5
     bandwidth_khz: float = 500.0
     ref_level_dbuv: float = 120.0
@@ -78,7 +78,7 @@ class FFMConfig:
         """Device bounds from SCPI 2.2; validate before stopping/reconfiguring hardware."""
         bounds = (
             ("中心频率（MHz）", self.center_mhz, 0, 8000),
-            ("频谱带宽（kHz）", self.span_khz, 0, 8_000_000),
+            ("频谱带宽（kHz）", self.span_khz, 0, 320_000),
             ("解调带宽（kHz）", self.bandwidth_khz, 1.5, 500),
             ("参考电平（dBµV）", self.ref_level_dbuv, -256, 256),
             ("电平跨度（dB/格）", self.level_span_db, 1, 50),

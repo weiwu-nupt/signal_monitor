@@ -19,6 +19,8 @@ import numpy as np
 from PyQt6 import QtCore, QtWidgets
 import pyqtgraph as pg
 
+from .ffm_spectrum import FrequencyAxis
+
 
 CYAN = "#00d4ff"
 ORANGE = "#ff8c42"
@@ -101,8 +103,9 @@ class WaterfallPlot(pg.PlotWidget):
 
     def __init__(self, history_rows=200, display_bins=2048, parent=None,
                  levels=None):
-        super().__init__(parent)
-        self.setLabel("bottom", "频率", units="Hz")
+        self.frequency_axis = FrequencyAxis(orientation="bottom")
+        super().__init__(parent, axisItems={"bottom": self.frequency_axis},
+                         background="#050a11")
         self.setLabel("left", "历史", units="帧")
         self.setMenuEnabled(False)
         self.hideButtons()
@@ -122,6 +125,24 @@ class WaterfallPlot(pg.PlotWidget):
         self.getViewBox().setMouseEnabled(x=True, y=False)
         self.showGrid(x=True, y=False, alpha=GRID_A)
         self.setYRange(0, history_rows)
+        self.getAxis("left").setWidth(72)
+        for name in ("left", "bottom"):
+            axis = self.getAxis(name)
+            axis.setPen(pg.mkPen("#7894af"))
+            axis.setTextPen(pg.mkPen("#a9c1dc"))
+            axis.setStyle(tickTextOffset=8)
+        self.getViewBox().sigRangeChanged.connect(self._sync_frequency_ticks)
+
+    def _sync_frequency_ticks(self, _view, ranges):
+        start, end = ranges[0]
+        spacing = max(1e-6, (end - start) / 8)
+        axis = self.frequency_axis
+        axis.set_view_format(start, end, spacing)
+        axis.setTicks([[(start + spacing * index,
+                        "" if index in (0, 8) else axis.format_frequency(
+                            start + spacing * index, spacing, include_unit=False,
+                            factor=axis._view_factor, unit=axis._view_unit))
+                       for index in range(9)]])
 
     def set_freq_range(self, start_hz, stop_hz):
         if abs(start_hz - self._f0) < 1 and abs(stop_hz - self._f1) < 1:
@@ -153,18 +174,17 @@ class WaterfallPlot(pg.PlotWidget):
 
     @staticmethod
     def _downsample(data, target):
-        n = len(data)
+        source = np.asarray(data, dtype=np.float32)
+        n = len(source)
+        if n == 0:
+            return np.full(target, -np.inf, dtype=np.float32)
         if n == target:
-            return data.astype(np.float32, copy=False)
+            return source
         if n < target:
             xs = np.linspace(0, n - 1, target)
-            return np.interp(xs, np.arange(n), data).astype(np.float32)
-        if n % target == 0:
-            return data.reshape(target, n // target).max(axis=1).astype(np.float32)
-        block = (n + target - 1) // target
-        padded = np.full(block * target, -np.inf, dtype=np.float32)
-        padded[:n] = data
-        return padded.reshape(target, block).max(axis=1)
+            return np.interp(xs, np.arange(n), source).astype(np.float32)
+        starts = np.linspace(0, n, target, endpoint=False, dtype=np.intp)
+        return np.maximum.reduceat(source, starts)
 
 
 # ============================================================

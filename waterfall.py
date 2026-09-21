@@ -151,25 +151,19 @@ class WaterfallView(pg.PlotWidget):
     def _downsample(data: np.ndarray, target_bins: int) -> np.ndarray:
         """
         降采样到 target_bins, 用 max-pooling 保留峰值.
-        快速路径: 用 ceil(n/target_bins) 作块大小, 用 -inf 填充到整除,
-                 reshape+max 全向量化, 比 array_split 快 ~50 倍.
+        使用均匀区间起点做 reduceat，确保每个输入点都落入某个显示列。
         """
-        n = len(data)
+        source = np.asarray(data, dtype=np.float32)
+        n = len(source)
+        if n == 0:
+            return np.full(target_bins, -np.inf, dtype=np.float32)
         if n == target_bins:
-            return data.astype(np.float32, copy=False)
+            return source
         if n < target_bins:
             xs = np.linspace(0, n - 1, target_bins)
-            return np.interp(xs, np.arange(n), data).astype(np.float32)
+            return np.interp(xs, np.arange(n), source).astype(np.float32)
 
-        # 整除快速路径
-        if n % target_bins == 0:
-            block = n // target_bins
-            return data.reshape(target_bins, block).max(axis=1).astype(np.float32)
-
-        # 通用快速路径: pad 到能整除
-        block = (n + target_bins - 1) // target_bins   # ceil 除
-        padded_len = block * target_bins
-        # 用 -inf 填充, max 会忽略
-        padded = np.full(padded_len, -np.inf, dtype=np.float32)
-        padded[:n] = data
-        return padded.reshape(target_bins, block).max(axis=1)
+        # 每个显示列对应原始数据中的一个连续区间。不补齐到块长整数倍，
+        # 否则 6401 -> 2048 这类非整除数据会在右侧产生空白列。
+        starts = np.linspace(0, n, target_bins, endpoint=False, dtype=np.intp)
+        return np.maximum.reduceat(source, starts)

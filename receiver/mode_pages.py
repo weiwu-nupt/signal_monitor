@@ -7,7 +7,7 @@
 每页:
   - 自带该模式的显示部件 (来自 mode_views)
   - 复用 mode_panels 的参数面板 (右侧)
-  - 顶部有 应用配置 / 开始 / 停止
+  - 右侧参数上方有 应用配置 / 暂停 / 停止
   - 订阅 controller 的数据信号, 只处理本模式相关数据
   - get_config() / mode 属性给上层下发用
 """
@@ -38,7 +38,7 @@ PAGE_STYLE = APP_STYLE
 
 
 class _BasePage(QtWidgets.QWidget):
-    """页面基类: 左显示区 + 右参数 + 顶部动作栏"""
+    """页面基类: 左显示区 + 右侧动作与参数。"""
 
     mode: RxMode = None
     title: str = ""
@@ -53,47 +53,58 @@ class _BasePage(QtWidgets.QWidget):
         root.setContentsMargins(6, 6, 6, 6)
         root.setSpacing(6)
 
-        # 顶部: 标题 + 动作
-        top = QtWidgets.QHBoxLayout()
-        if self.title:
-            lbl = QtWidgets.QLabel(self.title)
-            lbl.setObjectName("pageTitle")
-            top.addWidget(lbl)
-        top.addStretch(1)
-        self.btn_apply = QtWidgets.QPushButton("应用配置")
-        self.btn_start = QtWidgets.QPushButton("开始")
-        self.btn_start.setObjectName("primary")
-        self.btn_stop = QtWidgets.QPushButton("停止")
-        self.btn_stop.setObjectName("danger")
-        top.addWidget(self.btn_apply)
-        top.addWidget(self.btn_start)
-        top.addWidget(self.btn_stop)
-        root.addLayout(top)
-
-        # 主体: 左显示 | 右参数
+        # 主体: 左显示 | 右侧动作与参数
         split = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
+        self.main_splitter = split
         self.display_area = self._build_display()
         split.addWidget(self.display_area)
+
+        self.right_sidebar = QtWidgets.QWidget()
+        self.right_sidebar.setObjectName("receiverSidebar")
+        self.right_sidebar.setMinimumWidth(0)
+        self.right_sidebar.setMaximumWidth(440)
+        right_layout = QtWidgets.QVBoxLayout(self.right_sidebar)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.setSpacing(8)
+
+        actions = QtWidgets.QHBoxLayout()
+        actions.setContentsMargins(8, 0, 8, 0)
+        actions.setSpacing(6)
+        self.btn_apply = QtWidgets.QPushButton("应用配置")
+        self.btn_apply.setObjectName("primary")
+        self.btn_pause = QtWidgets.QPushButton("暂停")
+        self.btn_pause.setCheckable(True)
+        self.btn_stop = QtWidgets.QPushButton("停止")
+        self.btn_stop.setObjectName("danger")
+        for button in (self.btn_apply, self.btn_pause, self.btn_stop):
+            button.setSizePolicy(
+                QtWidgets.QSizePolicy.Policy.Fixed,
+                QtWidgets.QSizePolicy.Policy.Fixed)
+        actions.addWidget(self.btn_apply)
+        actions.addWidget(self.btn_pause)
+        actions.addWidget(self.btn_stop)
+        actions.addStretch(1)
+        right_layout.addLayout(actions)
 
         right = QtWidgets.QScrollArea()
         right.setWidgetResizable(True)
         right.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         right.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
-        right.setMinimumWidth(290)
-        right.setMaximumWidth(440)
         self.panel = self._build_panel()
         right.setWidget(self.panel)
-        split.addWidget(right)
+        right_layout.addWidget(right, 1)
+        split.addWidget(self.right_sidebar)
         split.setStretchFactor(0, 4)
         split.setStretchFactor(1, 1)
         split.setSizes([1060, 330])
         split.setCollapsible(0, False)
-        split.setCollapsible(1, False)
+        split.setCollapsible(1, True)
         root.addWidget(split, 1)
 
-        self.btn_apply.clicked.connect(self._on_apply)
-        self.btn_start.clicked.connect(self._on_start)
-        self.btn_stop.clicked.connect(self.controller.stop)
+        self._display_paused = False
+        self.btn_apply.clicked.connect(self._on_start)
+        self.btn_pause.toggled.connect(self._set_display_paused)
+        self.btn_stop.clicked.connect(self._stop)
 
         self._connect_signals()
         self.set_enabled_actions(False)
@@ -114,14 +125,28 @@ class _BasePage(QtWidgets.QWidget):
         self.controller.apply_mode(self.apply_mode(), self.get_config())
 
     def _on_start(self):
+        self._set_display_paused(False)
         applied = self._on_apply()
         if applied is not False and self.controller.is_connected():
             self.controller.start()
 
+    def _stop(self):
+        self._set_display_paused(False)
+        self.controller.stop()
+
+    def _set_display_paused(self, paused: bool):
+        self._display_paused = bool(paused)
+        self.btn_pause.blockSignals(True)
+        self.btn_pause.setChecked(self._display_paused)
+        self.btn_pause.setText("继续" if self._display_paused else "暂停")
+        self.btn_pause.blockSignals(False)
+
     def set_enabled_actions(self, connected: bool):
         self.btn_apply.setEnabled(connected)
-        self.btn_start.setEnabled(connected)
+        self.btn_pause.setEnabled(False)
         self.btn_stop.setEnabled(False)
+        if not connected:
+            self._set_display_paused(False)
 
 
 # ============================================================
@@ -248,11 +273,13 @@ class FFMPage(_BasePage):
         lower10, lower30 = np.percentile(values, (10, 30))
         noise = float(lower30 + .7 * (lower30 - lower10))
         peak = float(np.max(values))
-        required = (peak - noise + max(5, (peak - noise) * .1)) / 6
-        spacing = next((x for x in (1, 2, 5, 10, 20, 50) if x >= required), 50)
-        reference = min(self.panel.ref.maximum, max(self.panel.ref.minimum, math.ceil(noise + 6 * spacing)))
+        _current_reference, spacing, _divisions = self.panel.display_scale()
+        headroom = max(5.0, (peak - noise) * .1)
+        target = max(noise + 6 * spacing, peak + headroom)
+        lower = math.ceil(self.panel.ref.minimum / 5) * 5
+        upper = math.floor(self.panel.ref.maximum / 5) * 5
+        reference = min(upper, max(lower, math.ceil(target / 5) * 5))
         self.panel.ref.setValue(reference)
-        self.panel.lvspan.setValue(spacing)
         self._update_level_scale()
 
     def _apply_display_axes(self, config):
@@ -286,6 +313,8 @@ class FFMPage(_BasePage):
     @QtCore.pyqtSlot(object)
     def _on_spectrum(self, data: SpectrumData):
         if self.controller.current_mode != self.mode:
+            return
+        if self._display_paused:
             return
         complete = self._spectrum_stitcher.add(data)
         if complete is None:

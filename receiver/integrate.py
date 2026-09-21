@@ -100,8 +100,11 @@ class ReceiverPagesManager(QtCore.QObject):
 
     def _on_running(self, running: bool):
         for page in set(self.pages.values()):
-            page.btn_start.setEnabled(not running and self.controller.is_connected())
+            page.btn_apply.setEnabled(self.controller.is_connected())
+            page.btn_pause.setEnabled(running)
             page.btn_stop.setEnabled(running)
+            if not running:
+                page._set_display_paused(False)
 
     def _on_status_msg(self, msg: str):
         self._flash_status(msg)

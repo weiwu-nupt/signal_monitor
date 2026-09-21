@@ -6,8 +6,9 @@ import numpy as np
 from PyQt6 import QtCore, QtGui, QtWidgets
 
 from receiver.controller import FFMConfig, RxMode
-from receiver.ffm_spectrum import TraceProcessor
+from receiver.ffm_spectrum import FrequencyAxis, TraceProcessor
 from receiver.integrate import _StandaloneWindow
+from receiver.mode_views import WaterfallPlot
 from receiver.rx_protocol import SpectrumData
 
 
@@ -55,6 +56,68 @@ class WindowTests(unittest.TestCase):
         self.assertEqual([self.page.trace_mode.itemText(i) for i in range(4)], list(TraceProcessor.MODES))
         self.assertEqual(self.page.spectrum.getAxis("left").labelUnits, "dBµV")
 
+    def test_actions_are_in_sidebar_and_apply_starts(self):
+        buttons = self.page.findChildren(QtWidgets.QPushButton)
+        self.assertNotIn("开始", [button.text() for button in buttons])
+        self.assertTrue(self.page.right_sidebar.isAncestorOf(self.page.btn_apply))
+        self.assertTrue(self.page.right_sidebar.isAncestorOf(self.page.btn_pause))
+        self.assertTrue(self.page.right_sidebar.isAncestorOf(self.page.btn_stop))
+        self.assertEqual(
+            self.page.btn_apply.sizePolicy().horizontalPolicy(),
+            QtWidgets.QSizePolicy.Policy.Fixed)
+        self.assertLessEqual(
+            self.page.btn_apply.width(), self.page.btn_apply.sizeHint().width() + 2)
+        self.page.main_splitter.setSizes([1200, 0])
+        self.app.processEvents()
+        self.assertEqual(self.page.main_splitter.sizes()[1], 0)
+        self.page.main_splitter.setSizes([1060, 330])
+        with (patch.object(self.page, "_on_apply", return_value=True),
+              patch.object(self.page.controller, "is_connected", return_value=True),
+              patch.object(self.page.controller, "start") as start):
+            self.page._on_start()
+        start.assert_called_once_with()
+
+    def test_pause_freezes_display_and_changes_to_continue(self):
+        self.page.controller._mode = RxMode.FFM
+        self.page._refresh_ms = 0
+        first = SpectrumData(
+            2_000_000_000, 320_000_000, 0, 3,
+            np.array([10, 20, 30], dtype=np.float32))
+        second = SpectrumData(
+            2_000_000_000, 320_000_000, 0, 3,
+            np.array([40, 50, 60], dtype=np.float32))
+        self.page._on_spectrum(first)
+        self.page._set_display_paused(True)
+        self.assertEqual(self.page.btn_pause.text(), "继续")
+        self.page._on_spectrum(second)
+        np.testing.assert_allclose(self.page.spectrum.values, first.levels_db)
+        self.page._set_display_paused(False)
+        self.assertEqual(self.page.btn_pause.text(), "暂停")
+        self.page._on_spectrum(second)
+        np.testing.assert_allclose(self.page.spectrum.values, second.levels_db)
+
+    def test_waterfall_uses_full_width_and_same_frequency_axis(self):
+        source = np.arange(6401, dtype=np.float32)
+        row = WaterfallPlot._downsample(source, 2048)
+        self.assertEqual(row.shape, (2048,))
+        self.assertTrue(np.all(np.isfinite(row)))
+        self.assertEqual(row[-1], source[-1])
+        self.assertIsInstance(self.page.spectrum.getAxis("bottom"), FrequencyAxis)
+        self.assertIsInstance(self.page.waterfall.getAxis("bottom"), FrequencyAxis)
+        np.testing.assert_allclose(
+            self.page.spectrum.viewRange()[0], self.page.waterfall.viewRange()[0])
+
+    def test_hover_uses_separate_frequency_and_level_labels(self):
+        plot = self.page.spectrum
+        frequencies = np.array([1.9e9, 2.0e9, 2.1e9])
+        plot.update_spectrum(frequencies, [-20, -10, -30])
+        point = plot.getViewBox().mapViewToScene(QtCore.QPointF(2.0e9, -10))
+        plot._mouse_moved((point,))
+        self.assertTrue(plot.level_label.isVisible())
+        self.assertTrue(plot.frequency_label.isVisible())
+        self.assertIn("dBµV", plot.level_label.toPlainText())
+        self.assertIn("GHz", plot.frequency_label.toPlainText())
+
     def test_plain_editors_and_frequency_units(self):
         self.assertEqual(self.page.panel.findChildren(QtWidgets.QAbstractSpinBox), [])
         self.page.panel.center.editor.setText("100.123456")
@@ -84,7 +147,7 @@ class WindowTests(unittest.TestCase):
         self.assertIn("XdB 带宽（dB）", labels)
         self.assertFalse(any("间隔数量" in text or "标称间隔" in text for text in labels))
         self.assertEqual(panel.display_scale()[2], 10)
-        self.assertEqual(panel.span.value_hz(), 409_600_000)
+        self.assertEqual(panel.span.value_hz(), 320_000_000)
         self.assertGreaterEqual(panel.bw.findData(120.0), 0)
         self.assertEqual(panel.bw.findData(100.0), -1)
         panel.xdb_band.setText("40")
@@ -101,6 +164,8 @@ class WindowTests(unittest.TestCase):
 
     def test_document_bounds_and_bandwidth_relationship(self):
         panel = self.page.panel
+        with self.assertRaisesRegex(ValueError, "320000"):
+            FFMConfig(span_khz=320_000.001).validate()
         for editor, bad in ((panel.xdb_band, "101"), (panel.beta_band, "-1"),
                             (panel.meas_time, "10001")):
             original = editor.text()
@@ -131,24 +196,26 @@ class WindowTests(unittest.TestCase):
         self.assertEqual([panel.step.itemData(i) for i in range(panel.step.count())],
                          [12.5, 25, 50, 100, 200])
         self.assertEqual(panel.get_config().step_khz, 12.5)
-        self.assertEqual(panel.span.editor.text(), "409.6")
+        self.assertEqual(panel.span.editor.text(), "320")
         self.assertEqual(panel.span.unit.currentText(), "MHz")
         for hz in (0, 8_000_000_000):
             panel.center.setText(hz)
+            config = panel.get_config()
+            self.assertEqual(config.center_mhz, hz / 1e6)
+        for hz in (0, 320_000_000):
             panel.span.setText(hz)
             config = panel.get_config()
             self.page._apply_display_axes(config)
-            self.assertEqual(config.center_mhz, hz / 1e6)
             self.assertEqual(config.span_khz, hz / 1e3)
-        for hz in (-1, 8_000_000_001):
+        for hz in (-1, 320_000_001):
             panel.span.setText(hz)
             with self.assertRaises(ValueError):
                 panel.get_config()
-        panel.span.setText(409_600_000)
+        panel.span.setText(320_000_000)
         commands = []
         with patch.object(self.page.controller.tcp, "send_many", commands.extend):
             self.page.controller._apply_ffm(panel.get_config())
-        self.assertIn("FREQuency:SPAN 409600.0 kHz", commands)
+        self.assertIn("FREQuency:SPAN 320000.0 kHz", commands)
 
     def test_user_parameter_list_and_zero_defaults(self):
         panel = self.page.panel
@@ -169,7 +236,7 @@ class WindowTests(unittest.TestCase):
         self.page.trace_mode.setCurrentText("最大保持")
         self.page._last_ffm_update_ms = QtCore.QDateTime.currentMSecsSinceEpoch()
         for values in ([10, 20, 30], [50, 60, 70], [5, 6, 7]):
-            self.page._on_spectrum(SpectrumData(2_000_000_000, 409_600_000, 0, 3, np.array(values)))
+            self.page._on_spectrum(SpectrumData(2_000_000_000, 320_000_000, 0, 3, np.array(values)))
         np.testing.assert_allclose(self.page.spectrum.display_values, [50, 60, 70])
         with patch.object(self.page.controller, "apply_mode"):
             self.assertTrue(self.page._on_apply())
@@ -199,10 +266,14 @@ class WindowTests(unittest.TestCase):
         np.testing.assert_allclose(y_after, y_before)
         self.app.processEvents()
         np.testing.assert_allclose(self.page.waterfall.viewRange()[0], x_after, atol=1)
+        self.page.panel.lvspan.setValue(7)
+        spacing_before = self.page.panel.lvspan.value()
         plot.update_spectrum(np.linspace(*x_before, 101), np.r_[np.full(100, 20), 60])
         self.page._auto_adjust()
         np.testing.assert_allclose(plot.viewRange()[0], x_before)
         self.assertGreater(plot.viewRange()[1][1], 60)
+        self.assertEqual(self.page.panel.lvspan.value(), spacing_before)
+        self.assertEqual(self.page.panel.ref.value() % 5, 0)
         old_top = self.page.panel.ref.value()
         self.page._shift_reference(1)
         self.assertEqual(self.page.panel.ref.value(), old_top + self.page.panel.lvspan.value())

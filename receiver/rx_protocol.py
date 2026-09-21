@@ -5,8 +5,8 @@
     header (8B): version(uint32) + count(uint32)
     body * count:
         version 0/1: metadata(16B) = tag,ver,chan_cnt(1),chan_id(1),chan_state(2),size(4)
-        version >=2: metadata(16B) = tag,ver,time_s,time_ns,size
-        data (size - 16 字节)
+        version >=2: metadata(20B) = tag,ver,time_s,time_ns,size
+        data (size - metadata 字节数)
 
 tag 数据类别:
     1   IQ        2   Level     4   Spectrum   8 DFind   16 DFPan
@@ -62,7 +62,8 @@ PSCAN_VERSION = 40
 SCAN_VERSION = 40
 
 HEADER_SIZE = 8
-METADATA_SIZE = 16
+LEGACY_METADATA_SIZE = 16
+TIMESTAMPED_METADATA_SIZE = 20
 
 SPECTRUM_LEVEL_SCALE = 0.1   # 频谱/扫描数据单位 0.1 dBμV
 
@@ -337,11 +338,14 @@ class DataProtocolParser:
             # 试探整帧长度
             total = HEADER_SIZE
             ok = True
+            metadata_size = (TIMESTAMPED_METADATA_SIZE
+                             if version >= 2 else LEGACY_METADATA_SIZE)
+            size_offset = 16 if version >= 2 else 12
             for _ in range(count):
-                if len(self._buf) < total + METADATA_SIZE:
+                if len(self._buf) < total + metadata_size:
                     ok = False
                     break
-                size = struct.unpack_from("<I", self._buf, total + 12)[0]
+                size = struct.unpack_from("<I", self._buf, total + size_offset)[0]
                 total += size
             if not ok or len(self._buf) < total:
                 break
@@ -353,7 +357,9 @@ class DataProtocolParser:
     # -------- 内部 --------
 
     def _parse_meta(self, data: bytes, off: int, header_ver: int) -> Optional[Metadata]:
-        if off + METADATA_SIZE > len(data):
+        metadata_size = (TIMESTAMPED_METADATA_SIZE
+                         if header_ver >= 2 else LEGACY_METADATA_SIZE)
+        if off + metadata_size > len(data):
             return None
         tag, ver = struct.unpack_from("<II", data, off)
         if header_ver >= 2:
@@ -368,10 +374,12 @@ class DataProtocolParser:
 
     def _parse_body(self, data: bytes, off: int, header_ver: int):
         meta = self._parse_meta(data, off, header_ver)
-        if meta is None or meta.size < METADATA_SIZE:
+        metadata_size = (TIMESTAMPED_METADATA_SIZE
+                         if header_ver >= 2 else LEGACY_METADATA_SIZE)
+        if meta is None or meta.size < metadata_size:
             self.stats["bad"] += 1
             return None, off
-        body_start = off + METADATA_SIZE
+        body_start = off + metadata_size
         body_end = off + meta.size
         if body_end > len(data):
             self.stats["bad"] += 1
@@ -478,7 +486,9 @@ def _build_frame(bodies: list, header_version: int = 0) -> bytes:
     """bodies: list of (tag, version, payload_bytes)"""
     out = struct.pack("<II", header_version, len(bodies))
     for tag, ver, payload in bodies:
-        size = METADATA_SIZE + len(payload)
+        metadata_size = (TIMESTAMPED_METADATA_SIZE
+                         if header_version >= 2 else LEGACY_METADATA_SIZE)
+        size = metadata_size + len(payload)
         if header_version >= 2:
             meta = struct.pack("<IIIII", tag, ver, 0, 0, size)
         else:

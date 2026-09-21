@@ -2,7 +2,7 @@
 from collections import deque
 import numpy as np
 import pyqtgraph as pg
-from PyQt6 import QtCore, QtWidgets
+from PyQt6 import QtCore, QtGui, QtWidgets
 from PyQt6.QtCore import QRectF, Qt
 
 
@@ -149,10 +149,19 @@ class FFMSpectrumPlot(pg.PlotWidget):
             axis.setStyle(tickTextOffset=8)
         self.getViewBox().sigRangeChanged.connect(self._sync_frequency_ticks)
 
-        self.hover_line = pg.InfiniteLine(angle=90, pen=pg.mkPen("#35d955"))
-        self.hover_dot = pg.ScatterPlotItem(size=8, brush=pg.mkBrush("#35d955"))
-        self.hover_label = pg.TextItem(color="#dce9fa", fill=pg.mkBrush("#14283d"), anchor=(1, 0))
-        for item in (self.hover_line, self.hover_dot, self.hover_label):
+        self.hover_line = pg.InfiniteLine(
+            angle=90, movable=False, pen=pg.mkPen("#35d955", width=1.2))
+        self.hover_dot = pg.ScatterPlotItem(
+            size=12, pen=pg.mkPen("#35d955", width=1), brush=pg.mkBrush("#35d955"))
+        label_font = QtGui.QFont("Microsoft YaHei UI", 10)
+        self.level_label = pg.TextItem(
+            color="#061008", fill=pg.mkBrush("#35d955"), anchor=(0, .5))
+        self.frequency_label = pg.TextItem(
+            color="#061008", fill=pg.mkBrush("#35d955"), anchor=(.5, 1))
+        self.level_label.setFont(label_font)
+        self.frequency_label.setFont(label_font)
+        for item in (self.hover_line, self.hover_dot,
+                     self.level_label, self.frequency_label):
             self.addItem(item, ignoreBounds=True)
             item.hide()
         self._mouse_proxy = pg.SignalProxy(self.scene().sigMouseMoved, rateLimit=30, slot=self._mouse_moved)
@@ -228,7 +237,8 @@ class FFMSpectrumPlot(pg.PlotWidget):
         self._hide_hover()
 
     def _hide_hover(self):
-        for item in (self.hover_line, self.hover_dot, self.hover_label):
+        for item in (self.hover_line, self.hover_dot,
+                     self.level_label, self.frequency_label):
             item.hide()
 
     def _mouse_moved(self, args):
@@ -247,10 +257,15 @@ class FFMSpectrumPlot(pg.PlotWidget):
             return
         self.hover_line.setPos(frequency)
         self.hover_dot.setData([frequency], [level])
-        self.hover_label.setText(f"{frequency / 1e6:.6f} MHz  |  {level:.1f} dBµV")
         (left, right), (bottom, top) = view.viewRange()
-        self.hover_label.setPos(right - (right-left)*.01, top - (top-bottom)*.02)
-        for item in (self.hover_line, self.hover_dot, self.hover_label):
+        self.level_label.setText(f"{level:.2f} dBµV")
+        self.level_label.setPos(frequency, level)
+        spacing = max(1e-6, (right - left) / 8)
+        self.frequency_label.setText(
+            self.frequency_axis.format_frequency(frequency, spacing))
+        self.frequency_label.setPos(frequency, bottom + (top - bottom) * .015)
+        for item in (self.hover_line, self.hover_dot,
+                     self.level_label, self.frequency_label):
             item.show()
 
     def leaveEvent(self, event):
