@@ -52,6 +52,10 @@ class RxMode(Enum):
 # 各模式配置 dataclass
 # ============================================================
 
+# 用户确认的实际接收机频谱带宽档位（MHz）。
+FFM_SPANS_MHZ = (2, 5, 10, 20, 40, 80, 160, 320)
+
+
 @dataclass
 class FFMConfig:
     # 射频控制参数
@@ -91,6 +95,8 @@ class FFMConfig:
         for label, value, low, high in bounds:
             if not math.isfinite(value) or not low <= value <= high:
                 raise ValueError(f"{label}范围为 {low:g}～{high:g}")
+        if self.span_khz not in tuple(mhz * 1000 for mhz in FFM_SPANS_MHZ):
+            raise ValueError("频谱带宽仅支持 2、5、10、20、40、80、160、320 MHz")
         if self.step_khz not in (12.5, 25, 50, 100, 200):
             raise ValueError("频谱步进仅支持 12.5、25、50、100、200 kHz")
         if self.span_khz > 0 and self.bandwidth_khz > self.span_khz:
@@ -196,6 +202,8 @@ class ReceiverController(QtCore.QObject):
     runningChanged = QtCore.pyqtSignal(bool)
     statusMessage = QtCore.pyqtSignal(str)
     errorOccurred = QtCore.pyqtSignal(str)
+    recognitionFilterChanged = QtCore.pyqtSignal(object)
+    recognitionTargetsReady = QtCore.pyqtSignal(object)
 
     def __init__(self, parent: Optional[QtCore.QObject] = None):
         super().__init__(parent)
@@ -206,6 +214,10 @@ class ReceiverController(QtCore.QObject):
         self._tcp_port = 5025
         self._mode: Optional[RxMode] = None
         self._running = False
+        from fpga_closed_loop import TargetFilter
+        self.recognition_filter = TargetFilter()
+        self.recognition_rate_multiplier = 4.0
+        self._recognition_source = None
 
         self.tcp.connected.connect(lambda: self.connectedChanged.emit(True))
         self.tcp.disconnected.connect(lambda: self.connectedChanged.emit(False))
@@ -215,6 +227,25 @@ class ReceiverController(QtCore.QObject):
 
         self.udp.dataReceived.connect(self._on_udp_data)
         self.udp.errorOccurred.connect(self.errorOccurred)
+
+    def set_recognition_filter(self, selected_filter):
+        self.recognition_filter = selected_filter
+        if self._recognition_source is not None:
+            self._recognition_source.set_bandwidth_filter(
+                selected_filter.bandwidth_min_hz, selected_filter.bandwidth_max_hz)
+        self.recognitionFilterChanged.emit(selected_filter)
+
+    def bind_recognition_source(self, source):
+        """Bind an existing FPGA owner; never open a second set of DMA readers."""
+        self._recognition_source = source
+        self.set_recognition_filter(self.recognition_filter)
+        self.set_recognition_rate_multiplier(self.recognition_rate_multiplier)
+
+    def set_recognition_rate_multiplier(self, multiplier):
+        self.recognition_rate_multiplier = multiplier
+        source = self._recognition_source
+        if source is not None and hasattr(source, 'set_iq_rate_multiplier'):
+            source.set_iq_rate_multiplier(multiplier)
 
     # -------- 连接 --------
 

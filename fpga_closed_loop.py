@@ -85,6 +85,14 @@ class TargetFilter:
     bandwidth_min_hz: Optional[float] = None
     bandwidth_max_hz: Optional[float] = None
 
+    def __post_init__(self):
+        for value in (self.bandwidth_min_hz, self.bandwidth_max_hz):
+            if value is not None and (not np.isfinite(value) or value < 0):
+                raise ValueError('识别带宽必须是非负有限值')
+        if (self.bandwidth_min_hz is not None and self.bandwidth_max_hz is not None
+                and self.bandwidth_min_hz > self.bandwidth_max_hz):
+            raise ValueError('最小识别带宽不能大于最大识别带宽')
+
     def allows(self, target: Target) -> bool:
         return (
             (self.bandwidth_min_hz is None or target.bandwidth_hz >= self.bandwidth_min_hz)
@@ -398,8 +406,10 @@ class EnergyDetector:
     Noise is estimated in dB from the lowest-power population, not from a
     linear-power percentile: a mostly occupied wideband signal would otherwise
     incorrectly raise its own signal plateau to the reported noise floor.
-    The protection band is calculated in Hz from the measured occupied
-    bandwidth, then converted to the current spectrum's bin spacing.
+    The fine-spectrum path reports measured occupied intervals without DDC
+    guard margins. Broadband envelope/notch handling precedes narrow-carrier
+    segmentation; interval midpoints keep displayed edges aligned with data.
+    The legacy coarse OBW path retains its separate capture guard settings.
     """
 
     def __init__(
@@ -503,34 +513,92 @@ class EnergyDetector:
             exclude_filter_stopband=False,
         )
         levels_db = 10.0 * np.log10(np.maximum(values, np.finfo(np.float64).tiny))
-        active = levels_db >= noise_floor_db + snr_db
-        if not np.any(active):
+        return self._detect_occupied_regions(values, levels_db, noise_floor_db,
+                                             snr_db, center_hz, bandwidth_hz,
+                                             target_type, max_targets)
+
+    def _detect_occupied_regions(self, values, levels_db, noise_floor_db,
+                                 snr_db, center_hz, bandwidth_hz,
+                                 target_type, max_targets):
+        """Measure occupied intervals independently of DDC capture margins.
+
+        Resolve broadband plateaus before narrow peaks. A robust envelope keeps
+        weak skirts from joining separate emissions. Only small, balanced
+        notches inside two wide plateaus may be closed; ordinary carrier gaps
+        retain the narrow merge-gap setting.
+        """
+        if not len(values) or max_targets < 1:
             return []
         bin_hz = bandwidth_hz / len(values)
-        indices = np.flatnonzero(active)
-        groups: list[list[int]] = [[int(indices[0])]]
-        for index in indices[1:]:
-            if index - groups[-1][-1] <= int(np.ceil(self.merge_gap_hz / bin_hz)) + 1:
-                groups[-1].append(int(index))
-            else:
-                groups.append([int(index)])
-        candidates = []
-        for group in groups:
-            left, right = group[0], group[-1]
+
+        def intervals(mask, gap_bins=0):
+            indices = np.flatnonzero(mask)
+            if not indices.size:
+                return []
+            cuts = np.flatnonzero(np.diff(indices) > gap_bins + 1) + 1
+            return [(int(group[0]), int(group[-1])) for group in np.split(indices, cuts)]
+
+        # Median in dB rejects isolated strong carriers instead of smearing
+        # their linear power across a nearby weak plateau.
+        window = min(101, max(3, int(round(100_000 / bin_hz)) | 1))
+        envelope = np.median(np.lib.stride_tricks.sliding_window_view(
+            np.pad(levels_db, window // 2, mode='edge'), window), axis=1)
+        broad = []
+        for left, right in intervals(envelope >= noise_floor_db + snr_db):
+            if (right-left+1)*bin_hz < self.wide_min_bandwidth_hz:
+                continue
+            segment = envelope[left:right+1]
+            edge_level = max(noise_floor_db+snr_db, float(np.percentile(segment, 90))-26.0)
+            for start, stop in intervals(segment >= edge_level):
+                if (stop-start+1)*bin_hz >= self.wide_min_bandwidth_hz:
+                    broad.append((left+start, left+stop))
+        merged = []
+        for left, right in broad:
+            if merged:
+                prev_left, prev_right = merged[-1]
+                gap_hz = (left-prev_right-1)*bin_hz
+                notch_limit = min(250_000, .05*min(prev_right-prev_left+1, right-left+1)*bin_hz)
+                level_difference = abs(float(np.median(envelope[prev_left:prev_right+1]))
+                                       - float(np.median(envelope[left:right+1])))
+                if gap_hz <= notch_limit and level_difference <= 6.0:
+                    merged[-1] = (prev_left, right)
+                    continue
+            merged.append((left, right))
+
+        # A single quietest-bin floor underestimates coloured noise / residual
+        # skirts elsewhere in the band. Estimate a local lower population in
+        # bounded blocks, without a large rolling-window allocation.
+        noise_block = max(16, int(round(1_000_000 / bin_hz)))
+        anchors, floors = [], []
+        for start in range(0, len(values), noise_block):
+            stop = min(len(values), start+noise_block)
+            anchors.append((start+stop-1)/2)
+            floors.append(float(np.percentile(levels_db[start:stop], 20)))
+        local_noise = np.maximum(noise_floor_db, np.interp(np.arange(len(values)), anchors, floors))
+        active = levels_db >= local_noise + snr_db
+        for left, right in merged:
+            # Exclude transition skirts from becoming secondary detections.
+            margin = max(1, window)
+            active[max(0, left-margin):min(len(active), right+margin+1)] = False
+        measured = list(merged)
+        for left, right in intervals(active, int(np.ceil(self.merge_gap_hz / bin_hz))):
             if right - left + 1 < self.min_bins:
                 continue
-            occupied_hz = (right - left + 1) * bin_hz
-            guard_hz = min(
-                self.max_guard_hz,
-                max(self.min_guard_hz, occupied_hz * self.relative_guard),
-            )
-            guard_bins = int(np.ceil(guard_hz / bin_hz))
-            left, right = max(0, left - guard_bins), min(len(values) - 1, right + guard_bins)
-            segment = values[left:right + 1]
-            weighted_bin = (np.arange(left, right + 1) * segment).sum() / max(segment.sum(), 1.0)
-            frequency = center_hz - bandwidth_hz / 2.0 + weighted_bin * bin_hz
-            width = max(bin_hz, (right - left + 1) * bin_hz)
-            candidates.append((float(segment.max()), frequency, width))
+            local = levels_db[left:right+1]
+            # Remove strong-carrier skirts and re-segment valleys, rather than
+            # counting the entire noise-threshold footprint as signal bandwidth.
+            threshold = np.maximum(local_noise[left:right+1] + snr_db, float(local.max()) - 26.0)
+            for start, stop in intervals(local >= threshold,
+                                         int(np.ceil(self.merge_gap_hz / bin_hz))):
+                if stop-start+1 >= self.min_bins:
+                    measured.append((left+start, left+stop))
+        candidates = []
+        for left, right in measured:
+            # FFT values live at bin centres. Symmetric half-bin edges make
+            # centre +/- bandwidth/2 exactly reproduce the measured interval.
+            frequency = center_hz - bandwidth_hz/2 + (left+right)*bin_hz/2
+            width = (right-left+1)*bin_hz
+            candidates.append((float(values[left:right+1].max()), frequency, width))
         candidates.sort(reverse=True, key=lambda item: item[0])
         targets = []
         for sequence, (_, frequency, width) in enumerate(candidates[:max_targets]):
@@ -615,6 +683,12 @@ def build_target_batch(targets: list[Target]) -> bytes:
         targets = [Target("narrow", 0, 0, 0, 0)]
     if len(targets) > MAX_WIDE_TARGETS + MAX_NARROW_TARGETS:
         raise ValueError("too many targets")
+    for kind, limit in (("wide", MAX_WIDE_TARGETS), ("narrow", MAX_NARROW_TARGETS)):
+        group = [t for t in targets if t.target_type == kind]
+        if len(group) > limit or len({t.sequence for t in group}) != len(group):
+            raise ValueError("too many or duplicate target slots")
+        if any(not 0 <= t.sequence < limit for t in group):
+            raise ValueError("target slot outside channel capacity")
     records = []
     for target in targets:
         if target.target_type not in ("wide", "narrow"):
@@ -624,7 +698,7 @@ def build_target_batch(targets: list[Target]) -> bytes:
         if target.bandwidth_hz == 0:
             if target != Target("narrow", 0, 0, 0, 0):
                 raise ValueError("only canonical empty target may have zero bandwidth")
-        elif target.bandwidth_hz < 1 or (target.target_type == "narrow" and target.bandwidth_hz > 12_800_000):
+        elif target.bandwidth_hz < 1 or (target.target_type == "narrow" and target.bandwidth_hz > 20_000_000) or (target.target_type == "wide" and target.bandwidth_hz <= 20_000_000):
             raise ValueError("invalid target bandwidth")
         record = bytearray(TARGET_RECORD_BYTES)
         struct.pack_into("<I", record, 0, SYNC_WORD)
@@ -668,10 +742,12 @@ class SpectrumDDCClosedLoop:
         target_filter: Optional[TargetFilter] = None,
         target_interval_s: float = 0.25,
         queue_size: int = 64,
+        iq_timeout_s: float = 30.0,
     ):
         self.detector = detector or EnergyDetector()
         self.target_filter = target_filter or TargetFilter()
         self.target_interval_s = target_interval_s
+        self._iq_rate_multiplier = 4.0
         self._queue: Queue[FPGASpectrumMessage] = Queue(maxsize=queue_size)
         self._narrow_assembler = NarrowSpectrumAssembler()
         self._iq_queue: Queue[IQPacket] = Queue(maxsize=16)
@@ -685,24 +761,38 @@ class SpectrumDDCClosedLoop:
         self._last_send_s = 0.0
         self._lock = threading.Lock()
         self._send_lock = threading.Lock()
+        from recognition_schedule import RecognitionSchedule
+        self._iq_timeout_s = iq_timeout_s
+        self._schedule = RecognitionSchedule(timeout_s=iq_timeout_s)
         self._stats = {"spectrum_ok": 0, "signal_ok": 0, "bad_crc": 0, "drops": 0, "bytes_dropped": 0, "target_batches": 0, "iq_packets": 0}
 
     def set_error_callback(self, callback: Callable[[Exception], None]) -> None:
         self._error_callback = callback
 
     def set_iq_callback(self, callback: Callable[[IQPacket], None]) -> None:
+        """Synchronous callback: return only after recognition/result persistence.
+
+        For an asynchronous GPU consumer, use get_iq_packet() and explicitly
+        complete_iq_recognition() after that packet has a saved result.
+        """
         self._iq_callback = callback
 
     def set_detector_snr_db(self, snr_db: float) -> None:
         """Set the live energy-detection threshold; takes effect next frame."""
         self.detector.set_snr_db(snr_db)
 
+    def set_iq_rate_multiplier(self, multiplier: float) -> None:
+        if not np.isfinite(multiplier) or not 3 <= multiplier <= 4:
+            raise ValueError('IQ采样率倍数必须在3～4之间')
+        with self._lock:
+            self._iq_rate_multiplier = float(multiplier)
+
     def set_bandwidth_filter(
         self,
         minimum_hz: Optional[float],
         maximum_hz: Optional[float],
     ) -> None:
-        """Apply an IQ-request bandwidth range immediately to all detections."""
+        """Update eligibility at the next round; never overwrite in-flight slots."""
         if minimum_hz is not None and minimum_hz < 0:
             raise ValueError("minimum bandwidth must not be negative")
         if maximum_hz is not None and maximum_hz < 0:
@@ -715,8 +805,6 @@ class SpectrumDDCClosedLoop:
                 key: [target for target in detected if self.target_filter.allows(target)]
                 for key, detected in self._latest_detected.items()
             }
-        if self._running:
-            self._send_current_targets()
 
     def start(self) -> None:
         if self._running:
@@ -727,7 +815,9 @@ class SpectrumDDCClosedLoop:
             "C2H2/C2H3 IQ, H2C1 targets",
             flush=True,
         )
-        for name, fn in (("WideSpectrum", self._wide_loop), ("NarrowSpectrum", self._narrow_loop), ("WideIQ", lambda: self._iq_loop("wide")), ("NarrowIQ", lambda: self._iq_loop("narrow"))):
+        from recognition_schedule import RecognitionSchedule
+        self._schedule = RecognitionSchedule(timeout_s=self._iq_timeout_s)
+        for name, fn in (("WideSpectrum", self._wide_loop), ("NarrowSpectrum", self._narrow_loop), ("WideIQ", lambda: self._iq_loop("wide")), ("NarrowIQ", lambda: self._iq_loop("narrow")), ("TargetScheduler", self._target_loop)):
             thread = threading.Thread(target=self._guarded, args=(fn,), name=name, daemon=True)
             thread.start()
             self._threads.append(thread)
@@ -746,10 +836,21 @@ class SpectrumDDCClosedLoop:
             return None
 
     def get_iq_packet(self, timeout: float = 0.0) -> Optional[IQPacket]:
+        """Fetch a ready lane; fetching/queuing never acknowledges recognition."""
         try:
             return self._iq_queue.get(timeout=timeout) if timeout > 0 else self._iq_queue.get_nowait()
         except Empty:
             return None
+
+    def complete_iq_recognition(self, iq: IQPacket) -> bool:
+        """Acknowledge a successful, persisted result before slots can be reused."""
+        with self._send_lock:
+            key = (iq.target_type, iq.sequence)
+            if self._schedule.received.get(key) is not iq or not self._schedule.complete(iq):
+                return False
+            self._stats['iq_results'] = self._stats.get('iq_results', 0)+1
+        self._maybe_send_targets()
+        return True
 
     def get_stats(self) -> dict:
         return dict(self._stats)
@@ -827,22 +928,19 @@ class SpectrumDDCClosedLoop:
     ) -> None:
         peak = max(float(power.max()), np.finfo(np.float64).tiny)
         db = np.maximum(10.0 * np.log10(np.maximum(power.astype(np.float64), np.finfo(np.float64).tiny) / peak), -120.0).astype(np.float32)
-        maximum = MAX_WIDE_TARGETS if target_type == "wide" else MAX_NARROW_TARGETS
+        maximum = len(power)  # Capacity limits apply to batches, never detections.
         detected = self.detector.detect(
             power, header["center_hz"], header["bandwidth_hz"], target_type,
             maximum, stream_id=(target_type, header["sequence"]),
         )
+        from recognition_schedule import classify_target
+        detected = [classify_target(t) for t in detected]
+        # Coarse wide detection and stitched fine detection have separate roles.
+        detected = [t for t in detected if t.target_type == target_type]
         selected = [
             target
             for target in detected
             if self.target_filter.allows(target)
-            # Type 0x02 DDC is one 12.8 MHz narrow channel.  A broad region
-            # visible in the stitched fine spectrum is useful for display,
-            # but it must not be encoded as an invalid narrow IQ request.
-            and (
-                target.target_type != "narrow"
-                or target.bandwidth_hz <= NARROW_CHANNEL_BANDWIDTH_HZ
-            )
         ]
         with self._lock:
             self._latest_detected[(target_type, header["sequence"])] = detected
@@ -904,15 +1002,35 @@ class SpectrumDDCClosedLoop:
             self._send_current_targets()
 
     def _send_current_targets(self) -> None:
-        with self._lock:
-            all_targets = [target for group in self._latest_targets.values() for target in group]
-        # Global batch limits; score ordering was already done per spectrum.
-        wide = [x for x in all_targets if x.target_type == "wide"][:MAX_WIDE_TARGETS]
-        narrow = [
-            Target("narrow", index, x.center_hz, x.bandwidth_hz, x.sample_rate_hz)
-            for index, x in enumerate(x for x in all_targets if x.target_type == "narrow")
-        ][:MAX_NARROW_TARGETS]
-        self._send_targets(wide + narrow)
+        with self._send_lock:
+            if not self._running:
+                return
+            self._schedule.check_timeout()
+            with self._lock:
+                all_targets = [t for group in self._latest_detected.values() for t in group]
+                selected_filter = self.target_filter
+                multiplier = self._iq_rate_multiplier
+            from ddc_rates import prepare_targets
+            all_targets, rejected = prepare_targets(all_targets, SYSTEM_SAMPLE_RATE_HZ, multiplier)
+            self._stats['iq_rate_rejected'] = len(rejected)
+            batch = self._schedule.next_batch(all_targets, selected_filter)
+            if batch is None or (not batch and not self._last_sent):
+                return
+            try:
+                send_target_batch(list(batch))
+            except Exception:
+                self._schedule.halted = True
+                raise
+            self._last_sent, self._last_send_s = batch, time.monotonic()
+            self._stats.update(target_batches=self._stats['target_batches']+1,
+                               signal_ok=len(batch), recognition_round=self._schedule.round,
+                               recognition_batch=self._schedule.index,
+                               recognition_batches=len(self._schedule.batches))
+
+    def _target_loop(self):
+        while self._running:
+            self._maybe_send_targets()
+            time.sleep(.05)
 
     def _send_targets(self, targets: list[Target]) -> None:
         with self._send_lock:
@@ -936,9 +1054,27 @@ class SpectrumDDCClosedLoop:
         try:
             while self._running:
                 iq = reader.next()
-                self._push(self._iq_queue, iq)
-                self._stats["iq_packets"] += 1
+                with self._send_lock:
+                    if not self._schedule.receive(iq):
+                        continue  # Duplicate, old batch, wrong slot or incomplete payload.
                 if self._iq_callback:
-                    self._iq_callback(iq)
+                    try:
+                        self._iq_callback(iq)
+                    except Exception:
+                        with self._send_lock:
+                            self._schedule.halted = True
+                        raise
+                    self.complete_iq_recognition(iq)
+                else:
+                    # Backpressure: do not drop an unrecognised 4 MiB payload.
+                    while self._running:
+                        try:
+                            self._iq_queue.put(iq, timeout=.1)
+                            break
+                        except Full:
+                            continue
+                    if not self._running:
+                        break
+                self._stats["iq_packets"] += 1
         finally:
             reader.close()

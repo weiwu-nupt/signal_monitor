@@ -23,6 +23,7 @@ from .controller import ReceiverController, RxMode
 from .ffm_spectrum import FFMSpectrumPlot, TraceProcessor
 from .inputs import NumberInput, NoWheelComboBox
 from .theme import APP_STYLE
+from .recognition_controls import RecognitionBandwidth
 from .mode_panels import (
     FFMPanel, PScanPanel, FScanPanel, MScanPanel, DDCPanel,
 )
@@ -176,6 +177,8 @@ class FFMPage(_BasePage):
         self.average_label.hide()
         self.average_count.hide()
         toolbar.addStretch()
+        self.show_waterfall = QtWidgets.QCheckBox("显示瀑布图")
+        toolbar.addWidget(self.show_waterfall)
         self.auto_adjust = QtWidgets.QPushButton("自动调整")
         self.auto_adjust.setToolTip("恢复完整频率范围，并按当前频谱自动设置电平刻度")
         toolbar.addWidget(self.auto_adjust)
@@ -200,6 +203,8 @@ class FFMPage(_BasePage):
         split.setStretchFactor(0, 3)
         split.setStretchFactor(1, 2)
         split.setSizes([450, 300])
+        self.waterfall.hide()
+        self.show_waterfall.toggled.connect(self.waterfall.setVisible)
         layout.addWidget(split, 1)
         self.trace_mode.currentTextChanged.connect(self._trace_mode_changed)
         self.average_count.editingFinished.connect(self._average_changed)
@@ -207,7 +212,17 @@ class FFMPage(_BasePage):
         return w
 
     def _build_panel(self):
-        return FFMPanel()
+        panel = FFMPanel()
+        self.recognition_bandwidth = RecognitionBandwidth()
+        self.recognition_bandwidth.changed.connect(self.controller.set_recognition_filter)
+        self.recognition_bandwidth.rateMultiplierChanged.connect(self.controller.set_recognition_rate_multiplier)
+        panel.layout().insertWidget(0, self.recognition_bandwidth)
+        self.recognition_status = QtWidgets.QLabel('识别等待频谱及 FPGA IQ 数据')
+        self.recognition_status.setWordWrap(True)
+        panel.layout().insertWidget(1, self.recognition_status)
+        from fpga_closed_loop import EnergyDetector
+        self._recognition_detector = EnergyDetector()
+        return panel
 
     def _connect_signals(self):
         self.controller.spectrumReady.connect(self._on_spectrum)
@@ -327,6 +342,23 @@ class FFMPage(_BasePage):
         self._last_ffm_update_ms = now
         self.spectrum.render_trace()
         self.waterfall.push_row(complete.levels_db)
+        from recognition_schedule import target_batches
+        # Detect at baseband; absolute RF centres can exceed the FPGA signed range.
+        levels = np.asarray(complete.levels_db, dtype=np.float64)
+        if levels.size and np.all(np.isfinite(levels)):
+            power = 10 ** ((levels - levels.max()) / 10)
+            targets = self._recognition_detector.detect(
+                power, 0, complete.span_hz, 'narrow', len(power),
+                stream_id=('receiver', *self._configured_band))
+            from ddc_rates import prepare_targets
+            from fpga_closed_loop import SYSTEM_SAMPLE_RATE_HZ
+            targets, rejected = prepare_targets(targets, SYSTEM_SAMPLE_RATE_HZ,
+                                                self.controller.recognition_rate_multiplier)
+            batches = target_batches(targets, self.controller.recognition_filter)
+            self.controller.recognitionTargetsReady.emit(batches)
+            self.recognition_status.setText(
+                f'检测 {len(targets)} 路，范围内 {sum(map(len, batches))} 路 / {len(batches)} 批；'
+                '窄带128路 / 宽带2路。等待 FPGA 4 MiB IQ。')
 
 
 # ============================================================

@@ -6,7 +6,7 @@ written to disk or copied through host memory by this module.  This is the
 interface a GPUDirect/P2P receiver should call after it has made a contiguous
 view of its DMA ring buffer.
 
-The pre-processing follows sigRec's recognition GUI: 10 ms IQ window, Hann
+The pre-processing follows sigRec's recognition GUI: configurable IQ windows, Hann
 STFT, power in dB, 1st/99th percentile normalisation, viridis RGB image, and
 ImageNet-normalised 224x224 ResNet input.
 """
@@ -17,12 +17,19 @@ from dataclasses import dataclass
 from pathlib import Path
 import struct
 from typing import Literal, Sequence
+import math
+import threading
+from queue import Queue, Empty, Full
+
+from recognition_results import (RecognitionResult, WindowPrediction,
+                                 window_spans, majority_result, IQ_PACKET_SAMPLES, effective_window_ms)
 
 import torch
 import torch.nn.functional as F
 
 
 DEFAULT_CLASS_NAMES = ("4G", "5G", "DVB", "GSM", "WiFi")
+DEFAULT_OPENSET_CLASS_NAMES = (*DEFAULT_CLASS_NAMES, 'Unknown')
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
 FPGA_SYNC_WORD = 0x1ACF_FC1D
@@ -30,17 +37,6 @@ FPGA_IQ_HEADER_BYTES = 32
 FPGA_IQ_PAYLOAD_BYTES = 4 * 1024 * 1024
 FPGA_IQ_PACKET_BYTES = FPGA_IQ_HEADER_BYTES + FPGA_IQ_PAYLOAD_BYTES
 FPGA_IQ_MESSAGE_LENGTH = 0x0040000D
-
-
-@dataclass(frozen=True)
-class RecognitionResult:
-    """Small host-side result returned after GPU inference."""
-
-    class_name: str
-    confidence: float
-    probabilities: dict[str, float]
-    sample_count: int
-    sample_rate_hz: int
 
 
 @dataclass(frozen=True)
@@ -122,8 +118,41 @@ def _build_resnet(num_classes: int, backbone: str):
 def _detect_backbone(state: dict[str, torch.Tensor]) -> str:
     for key, value in state.items():
         if key.endswith("fc.1.weight") or key.endswith("fc.weight"):
-            return {512: "resnet18", 2048: "resnet50"}.get(value.shape[1], "resnet50")
+            if value.shape[1] == 512:
+                return 'resnet34' if 'layer3.5.conv2.weight' in state else 'resnet18'
+            return {2048: "resnet50"}.get(value.shape[1], "resnet50")
     return "resnet50"
+
+
+def _checkpoint_model(saved, class_names=None):
+    """Resolve saved class metadata before unwrapping the state dictionary."""
+    if not isinstance(saved, dict):
+        raise ValueError('checkpoint must contain a ResNet state dictionary')
+    state = saved.get('state_dict', saved.get('model', saved))
+    if not isinstance(state, dict):
+        raise ValueError('checkpoint model must be a state dictionary')
+    classifier = next((value for key, value in state.items()
+                       if key in ('fc.1.weight', 'fc.weight')), None)
+    if classifier is None or classifier.ndim != 2:
+        raise ValueError('checkpoint does not contain a supported ResNet classifier')
+    count = classifier.shape[0]
+    names = class_names
+    if names is None:
+        names = saved.get('class_names', saved.get('classes', saved.get('known_classes')))
+        if (isinstance(names, (list, tuple)) and 'known_classes' in saved
+                and len(names)+1 == count):
+            names = (*names, 'Unknown')
+        if names is None:
+            if count == 5:
+                names = DEFAULT_CLASS_NAMES
+            elif count == 6:
+                names = DEFAULT_OPENSET_CLASS_NAMES
+            else:
+                raise ValueError(f'模型输出{count}类，但没有类别名称；无法确定标签顺序')
+    if (not isinstance(names, (list, tuple)) or len(names) != count
+            or any(not isinstance(n, str) or not n for n in names) or len(set(names)) != count):
+        raise ValueError(f'模型输出{count}类，类别名称/顺序配置不匹配')
+    return state, tuple(names)
 
 
 def _viridis_lut(device: torch.device) -> torch.Tensor:
@@ -132,10 +161,8 @@ def _viridis_lut(device: torch.device) -> torch.Tensor:
         import matplotlib
 
         values = matplotlib.colormaps["viridis"](range(256))[:, :3]
-    except (ImportError, AttributeError, KeyError):
-        # Kept only as a dependency-light fallback; deployed recognition uses
-        # matplotlib and therefore the exact sigRec viridis table above.
-        values = [[i / 255.0, i / 255.0, i / 255.0] for i in range(256)]
+    except (ImportError, AttributeError, KeyError) as exc:
+        raise RuntimeError('matplotlib viridis is required for sigRec preprocessing') from exc
     return torch.tensor(values, dtype=torch.float32, device=device)
 
 
@@ -148,21 +175,34 @@ class SigRecGpuRecognizer:
         *,
         class_names: Sequence[str] = DEFAULT_CLASS_NAMES,
         device: str | torch.device = "cuda",
-        nfft: int = 1024,
+        nfft: int | None = None,
         window_ms: float = 10.0,
+        inference_batch_size: int = 64,
+        max_images_per_packet: int | None = 64,
     ) -> None:
         self.device = torch.device(device)
         if self.device.type == "cuda" and self.device.index is None:
             self.device = torch.device("cuda:0")
         if self.device.type != "cuda" or not torch.cuda.is_available():
             raise RuntimeError("CUDA GPU is required for direct GPU IQ recognition")
+        self.adaptive_nfft = nfft is None
+        nfft = 1024 if nfft is None else nfft
         if nfft < 16 or nfft & (nfft - 1):
             raise ValueError("nfft must be a power of two and at least 16")
+        if not math.isfinite(window_ms) or window_ms <= 0 or inference_batch_size < 1:
+            raise ValueError('window duration and inference batch size must be positive')
         self.class_names = tuple(class_names)
+        if not self.class_names or len(set(self.class_names)) != len(self.class_names):
+            raise ValueError('class names must be unique and nonempty')
         self.nfft = nfft
         self.window_ms = float(window_ms)
+        self.inference_batch_size = int(inference_batch_size)
+        if max_images_per_packet is not None and (not isinstance(max_images_per_packet, int)
+                                                  or max_images_per_packet < 1):
+            raise ValueError('maximum image count must be a positive integer')
+        self.max_images_per_packet = max_images_per_packet
         self.model = model.to(self.device).eval() if model is not None else None
-        self._window = torch.hann_window(nfft, device=self.device)
+        self._windows = {}
         self._viridis = _viridis_lut(self.device)
         self._mean = torch.tensor(IMAGENET_MEAN, device=self.device).view(1, 3, 1, 1)
         self._std = torch.tensor(IMAGENET_STD, device=self.device).view(1, 3, 1, 1)
@@ -172,27 +212,77 @@ class SigRecGpuRecognizer:
         cls,
         checkpoint: str | Path,
         *,
-        class_names: Sequence[str] = DEFAULT_CLASS_NAMES,
+        class_names: Sequence[str] | None = None,
         device: str | torch.device = "cuda",
+        strict: bool = True,
+        window_ms: float = 10.0,
+        max_images_per_packet: int | None = 64,
     ) -> "SigRecGpuRecognizer":
         target = torch.device(device)
         saved = torch.load(Path(checkpoint), map_location=target, weights_only=False)
-        if isinstance(saved, dict) and "state_dict" in saved:
-            saved = saved["state_dict"]
-        if isinstance(saved, dict) and "model" in saved:
-            saved = saved["model"]
-        if not isinstance(saved, dict):
-            raise ValueError("checkpoint must contain a ResNet state dictionary")
+        saved, class_names = _checkpoint_model(saved, class_names)
         backbone = _detect_backbone(saved)
         model = _build_resnet(len(class_names), backbone)
-        missing, unexpected = model.load_state_dict(saved, strict=False)
+        missing, unexpected = model.load_state_dict(saved, strict=strict)
         if missing or unexpected:
             print(
                 f"[GPU NN] loaded {Path(checkpoint).name}: {backbone}, "
                 f"missing={len(missing)}, unexpected={len(unexpected)}",
                 flush=True,
             )
-        return cls(model, class_names=class_names, device=target)
+        return cls(model, class_names=class_names, device=target, window_ms=window_ms,
+                   max_images_per_packet=max_images_per_packet)
+
+    def _nfft_for_rate(self, sample_rate_hz):
+        if sample_rate_hz <= 0:
+            raise ValueError('sample_rate_hz must be positive')
+        if not self.adaptive_nfft:
+            return self.nfft
+        return max(64, min(1024, 1 << max(0, math.ceil(math.log2(sample_rate_hz*.00005)))))
+
+    def _image_from_normalized(self, components, nfft):
+        return self._images_from_normalized(components.unsqueeze(0), nfft)
+
+    def _images_from_normalized(self, components, nfft):
+        """Vectorized STFT, per-image quantiles and RGB for equal-length windows."""
+        if nfft not in self._windows:
+            self._windows[nfft] = torch.hann_window(nfft, periodic=False, device=self.device)
+        iq = torch.complex(components[:, :, 0], components[:, :, 1])
+        stft = torch.stft(iq, n_fft=nfft, hop_length=max(1, nfft//4),
+                          window=self._windows[nfft], center=False, return_complex=True)
+        # Include a final end-aligned FFT when STFT's stride leaves a tail.
+        # This uses real samples, with no padding, and covers the entire window.
+        if (iq.shape[1]-nfft) % max(1, nfft//4):
+            last = torch.fft.fft(iq[:, -nfft:]*self._windows[nfft]).unsqueeze(2)
+            stft = torch.cat((stft, last), dim=2)
+        power_db = torch.fft.fftshift(10*torch.log10(stft.abs().square()+1e-12), dim=1)
+        low, high = torch.quantile(power_db.flatten(1),
+                                  torch.tensor([.01, .99], device=self.device), dim=1)
+        low, high = low[:, None, None], high[:, None, None]
+        levels = ((power_db-low)/(high-low+1e-12)).clamp(0, 1)
+        # Matplotlib's 256-entry map uses floor(level*256), then RGB uint8.
+        indices = (levels*256).long().clamp(max=255)
+        rgb = (self._viridis[indices.flip(1)]*255).to(torch.uint8).float()/255
+        image = F.interpolate(rgb.permute(0, 3, 1, 2), size=(224, 224),
+                              mode='bilinear', align_corners=False, antialias=True)
+        # Match PIL RGB resizing/ToTensor quantisation in sigRec's GUI.
+        image = (image*255).round().clamp(0, 255)/255
+        return (image-self._mean)/self._std
+
+    def _window_images(self, components, spans, nfft):
+        # The last real window may have a different length. Group by length
+        # without padding, duplicating votes or dropping the tail.
+        images = []
+        index = 0
+        while index < len(spans):
+            start, size = spans[index]
+            end = index+1
+            while end < len(spans) and spans[end][1] == size:
+                end += 1
+            windows = components[start:start+(end-index)*size].reshape(end-index, size, 2)
+            images.append(self._images_from_normalized(windows, nfft))
+            index = end
+        return torch.cat(images)
 
     def image_from_iq(self, iq_i16: torch.Tensor, sample_rate_hz: int) -> torch.Tensor:
         """Convert a GPU ``int16 [N,2]`` IQ buffer to a GPU ResNet tensor."""
@@ -205,29 +295,13 @@ class SigRecGpuRecognizer:
         if sample_rate_hz <= 0:
             raise ValueError("sample_rate_hz must be positive")
 
-        wanted = int(sample_rate_hz * self.window_ms / 1000.0)
+        nfft = self._nfft_for_rate(sample_rate_hz)
+        wanted = max(nfft, round(sample_rate_hz * self.window_ms / 1000.0))
         count = min(int(iq_i16.shape[0]), wanted)
-        if count < self.nfft:
-            raise ValueError(f"need at least {self.nfft} IQ samples, received {count}")
+        if count < nfft:
+            raise ValueError(f"need at least {nfft} IQ samples, received {count}")
         raw = iq_i16[:count].to(torch.float32)
-        iq = torch.complex(raw[:, 0], raw[:, 1]) / 32768.0
-        stft = torch.stft(
-            iq,
-            n_fft=self.nfft,
-            hop_length=max(1, self.nfft // 4),
-            window=self._window,
-            center=False,
-            return_complex=True,
-        )
-        power_db = 10.0 * torch.log10(stft.abs().square().clamp_min(1e-12))
-        power_db = torch.fft.fftshift(power_db, dim=0)
-        low, high = torch.quantile(power_db, torch.tensor([0.01, 0.99], device=self.device))
-        levels = ((power_db - low) / (high - low).clamp_min(1e-12)).clamp_(0.0, 1.0)
-        indices = (levels * 255.0).to(torch.long)
-        # sigRec reverses the frequency rows before applying the colour map.
-        rgb = self._viridis[indices.flip(0)].permute(2, 0, 1).unsqueeze(0)
-        image = F.interpolate(rgb, size=(224, 224), mode="bicubic", align_corners=False)
-        return (image - self._mean) / self._std
+        return self._image_from_normalized(raw/32768.0, nfft)
 
     def iq_from_dma_bytes(self, dma_bytes: torch.Tensor, fmt: GpuIQFormat) -> torch.Tensor:
         """Expose a variable-format DMA payload as normalized GPU IQ samples.
@@ -268,23 +342,12 @@ class SigRecGpuRecognizer:
     def image_from_dma_bytes(self, dma_bytes: torch.Tensor, fmt: GpuIQFormat) -> torch.Tensor:
         """Preprocess a variable-format FPGA DMA packet directly on GPU."""
         iq = self.iq_from_dma_bytes(dma_bytes, fmt)
-        # ``image_from_iq`` is deliberately strict for the established FPGA
-        # int16 input.  Reuse its STFT path after converting to int16 only
-        # when possible; formats with another dynamic range run directly here.
-        wanted = int(fmt.sample_rate_hz * self.window_ms / 1000.0)
+        nfft = self._nfft_for_rate(fmt.sample_rate_hz)
+        wanted = max(nfft, round(fmt.sample_rate_hz * self.window_ms / 1000.0))
         iq = iq[:min(int(iq.shape[0]), wanted)]
-        if iq.shape[0] < self.nfft:
-            raise ValueError(f"need at least {self.nfft} IQ samples, received {iq.shape[0]}")
-        complex_iq = torch.complex(iq[:, 0], iq[:, 1])
-        stft = torch.stft(complex_iq, n_fft=self.nfft, hop_length=max(1, self.nfft // 4),
-                          window=self._window, center=False, return_complex=True)
-        power_db = 10.0 * torch.log10(stft.abs().square().clamp_min(1e-12))
-        power_db = torch.fft.fftshift(power_db, dim=0)
-        low, high = torch.quantile(power_db, torch.tensor([0.01, 0.99], device=self.device))
-        indices = (((power_db - low) / (high - low).clamp_min(1e-12)).clamp_(0.0, 1.0) * 255.0).to(torch.long)
-        rgb = self._viridis[indices.flip(0)].permute(2, 0, 1).unsqueeze(0)
-        image = F.interpolate(rgb, size=(224, 224), mode="bicubic", align_corners=False)
-        return (image - self._mean) / self._std
+        if iq.shape[0] < nfft:
+            raise ValueError(f"need at least {nfft} IQ samples, received {iq.shape[0]}")
+        return self._image_from_normalized(iq, nfft)
 
     def fpga_iq_packet_from_gpu(self, packet: torch.Tensor) -> tuple[FPGAIQHeader, torch.Tensor]:
         """Parse one fixed FPGA IQ packet while retaining all samples on GPU.
@@ -314,56 +377,124 @@ class SigRecGpuRecognizer:
         return header, self.image_from_iq(iq_i16, header.sample_rate_hz)
 
     @torch.inference_mode()
-    def infer_iq(self, iq_i16: torch.Tensor, sample_rate_hz: int) -> RecognitionResult:
+    def _infer_windows(self, components, sample_rate_hz, *, cancelled=None, progress=None, preview=None):
         if self.model is None:
             raise RuntimeError("no neural-network checkpoint has been loaded")
-        image = self.image_from_iq(iq_i16, sample_rate_hz)
-        probs = torch.softmax(self.model(image), dim=1)[0]
-        confidence, index = torch.max(probs, dim=0)
-        # Only this five-element result crosses back to the host.
-        values = probs.detach().to("cpu", non_blocking=False).tolist()
-        best = int(index.item())
-        return RecognitionResult(
-            class_name=self.class_names[best],
-            confidence=float(confidence.item()),
-            probabilities=dict(zip(self.class_names, map(float, values))),
-            sample_count=min(int(iq_i16.shape[0]), int(sample_rate_hz * self.window_ms / 1000.0)),
-            sample_rate_hz=int(sample_rate_hz),
-        )
+        nfft = self._nfft_for_rate(sample_rate_hz)
+        count = int(components.shape[0])
+        actual_window_ms = effective_window_ms(count, sample_rate_hz, self.window_ms, nfft,
+                                               self.max_images_per_packet)
+        spans = window_spans(count, sample_rate_hz, actual_window_ms, nfft)
+        predictions = []
+        prepared = Queue(maxsize=2)
+        stop_preparing = threading.Event()
+
+        def prepare():
+            def send(value):
+                while not stop_preparing.is_set():
+                    try:
+                        prepared.put(value, timeout=.05)
+                        return
+                    except Full:
+                        pass
+            try:
+                with torch.inference_mode(), torch.cuda.device(self.device):
+                    stream = torch.cuda.Stream(device=self.device)
+                    with torch.cuda.stream(stream):
+                        for offset in range(0, len(spans), self.inference_batch_size):
+                            if stop_preparing.is_set() or (cancelled and cancelled()):
+                                return
+                            batch = spans[offset:offset+self.inference_batch_size]
+                            images = self._window_images(components, batch, nfft)
+                            stream.synchronize()
+                            send(('images', (offset, batch, images)))
+            except Exception as exc:
+                send(('error', exc))
+            finally:
+                send(('done', None))
+
+        # Input normalization may still be queued on the caller's CUDA stream.
+        # Establish that dependency before a separate preparation stream reads it.
+        torch.cuda.current_stream(self.device).synchronize()
+        producer = threading.Thread(target=prepare, daemon=True)
+        producer.start()
+        try:
+            while True:
+                if cancelled and cancelled():
+                    raise InterruptedError('IQ recognition cancelled')
+                try:
+                    kind, value = prepared.get(timeout=.05)
+                except Empty:
+                    continue
+                if kind == 'done':
+                    break
+                if kind == 'error':
+                    raise value
+                offset, batch, images = value
+                images.record_stream(torch.cuda.current_stream(self.device))
+                self._consume_images(images, batch, offset, predictions, preview, progress, len(spans))
+        finally:
+            stop_preparing.set()
+            producer.join()
+        if cancelled and cancelled():
+            raise InterruptedError('IQ recognition cancelled')
+        return majority_result(predictions, self.class_names, count, int(sample_rate_hz),
+                               actual_window_ms, nfft)
+
+    def _consume_images(self, images, batch, offset, predictions, preview, progress, total):
+        """Inference consumer; the next image batch can prepare concurrently."""
+        logits = self.model(images)
+        if logits.shape != (len(batch), len(self.class_names)):
+            raise ValueError('model output shape/values do not match configured classes')
+        # One host synchronization per inference batch, rather than another
+        # scalar CUDA synchronization just to validate finite values.
+        outputs = torch.cat((torch.softmax(logits, dim=1),
+                             torch.isfinite(logits).all(dim=1, keepdim=True).to(logits.dtype)), dim=1).cpu().tolist()
+        probabilities = [row[:-1] for row in outputs]
+        if any(row[-1] != 1 for row in outputs) or any(not math.isfinite(p) for row in probabilities for p in row):
+            raise ValueError('model output shape/values do not match configured classes')
+        for (start, size), values in zip(batch, probabilities):
+            probs = dict(zip(self.class_names, map(float, values)))
+            winner = max(self.class_names, key=lambda c: probs[c])
+            predictions.append(WindowPrediction(start, size, winner, probs[winner], probs))
+        if preview and offset < 8:
+            # Only eight small display images cross to CPU; IQ remains on
+            # GPU. These are the exact RGB inputs supplied to the network.
+            count_preview = min(len(batch), 8-offset)
+            rgb = ((images[:count_preview]*self._std+self._mean)*255).round().clamp(0, 255)
+            rgb = rgb.to(torch.uint8).permute(0, 2, 3, 1).contiguous().cpu().numpy()
+            preview([dict(image_index=offset+i+1, start_sample=start, sample_count=size,
+                rgb=rgb[i], class_name=predictions[offset+i].class_name,
+                confidence=predictions[offset+i].confidence)
+                for i, (start, size) in enumerate(batch[:count_preview])])
+        if progress:
+            progress(len(predictions), total)
+
+    @torch.inference_mode()
+    def infer_iq(self, iq_i16: torch.Tensor, sample_rate_hz: int, *,
+                 cancelled=None, progress=None, preview=None) -> RecognitionResult:
+        """Classify every sample using disjoint images and majority voting."""
+        if (iq_i16.device != self.device or iq_i16.dtype != torch.int16
+                or iq_i16.ndim != 2 or iq_i16.shape[1] != 2):
+            raise ValueError('IQ must be int16 [N,2] on the recognizer GPU')
+        return self._infer_windows(iq_i16.float()/32768, sample_rate_hz,
+                                   cancelled=cancelled, progress=progress, preview=preview)
+
+    def infer_packet_iq(self, iq_i16, sample_rate_hz, **kwargs):
+        if iq_i16.shape != (IQ_PACKET_SAMPLES, 2):
+            raise ValueError('recognition requires exactly 4 MiB int16 IQ')
+        return self.infer_iq(iq_i16, sample_rate_hz, **kwargs)
 
     @torch.inference_mode()
     def infer_dma_bytes(self, dma_bytes: torch.Tensor, fmt: GpuIQFormat) -> RecognitionResult:
         """Run a loaded model using a variable-format GPU DMA packet."""
-        if self.model is None:
-            raise RuntimeError("no neural-network checkpoint has been loaded")
-        image = self.image_from_dma_bytes(dma_bytes, fmt)
-        probs = torch.softmax(self.model(image), dim=1)[0]
-        confidence, index = torch.max(probs, dim=0)
-        values = probs.detach().to("cpu", non_blocking=False).tolist()
-        best = int(index.item())
-        count = fmt.sample_count or (int(dma_bytes.numel()) - fmt.payload_offset_bytes) // (2 * fmt.component_bytes)
-        return RecognitionResult(
-            class_name=self.class_names[best], confidence=float(confidence.item()),
-            probabilities=dict(zip(self.class_names, map(float, values))),
-            sample_count=count, sample_rate_hz=fmt.sample_rate_hz,
-        )
+        return self._infer_windows(self.iq_from_dma_bytes(dma_bytes, fmt), fmt.sample_rate_hz)
 
     @torch.inference_mode()
     def infer_fpga_iq_packet(self, packet: torch.Tensor) -> RecognitionResult:
         """Run inference for one complete FPGA ``32B + 4MiB`` GPU packet."""
-        if self.model is None:
-            raise RuntimeError("no neural-network checkpoint has been loaded")
-        header, image = self.image_from_fpga_iq_packet(packet)
-        probs = torch.softmax(self.model(image), dim=1)[0]
-        confidence, index = torch.max(probs, dim=0)
-        values = probs.detach().to("cpu", non_blocking=False).tolist()
-        best = int(index.item())
-        return RecognitionResult(
-            class_name=self.class_names[best], confidence=float(confidence.item()),
-            probabilities=dict(zip(self.class_names, map(float, values))),
-            sample_count=FPGA_IQ_PAYLOAD_BYTES // 4,
-            sample_rate_hz=header.sample_rate_hz,
-        )
+        header, iq = self.fpga_iq_packet_from_gpu(packet)
+        return self.infer_packet_iq(iq, header.sample_rate_hz)
 
 
 def run_gpu_cache_loopback_test(sample_rate_hz: int = 12_800_000) -> dict[str, int | str]:

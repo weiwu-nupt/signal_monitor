@@ -147,7 +147,7 @@ class WindowTests(unittest.TestCase):
         self.assertIn("XdB 带宽（dB）", labels)
         self.assertFalse(any("间隔数量" in text or "标称间隔" in text for text in labels))
         self.assertEqual(panel.display_scale()[2], 10)
-        self.assertEqual(panel.span.value_hz(), 320_000_000)
+        self.assertEqual(panel.span.currentData(), 320_000.0)
         self.assertGreaterEqual(panel.bw.findData(120.0), 0)
         self.assertEqual(panel.bw.findData(100.0), -1)
         panel.xdb_band.setText("40")
@@ -177,9 +177,7 @@ class WindowTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             panel.get_config()
         panel.center.setText(2_000_000_000)
-        panel.span.setText(200_000)
-        with self.assertRaisesRegex(ValueError, "解调带宽不能大于频谱带宽"):
-            panel.get_config()
+        panel.span.setCurrentIndex(panel.span.findData(2000.0))
         panel.bw.setCurrentIndex(panel.bw.findData(120.0))
         self.assertEqual(panel.get_config().bandwidth_khz, 120)
 
@@ -191,31 +189,29 @@ class WindowTests(unittest.TestCase):
         self.app.sendEvent(panel.center.editor, event)
         self.assertEqual(panel.center.value_hz(), 2_000_025_000)
 
-    def test_manual_span_and_requested_limits(self):
+    def test_discrete_span_and_requested_limits(self):
         panel = self.page.panel
         self.assertEqual([panel.step.itemData(i) for i in range(panel.step.count())],
                          [12.5, 25, 50, 100, 200])
-        self.assertEqual(panel.get_config().step_khz, 12.5)
-        self.assertEqual(panel.span.editor.text(), "320")
-        self.assertEqual(panel.span.unit.currentText(), "MHz")
+        self.assertFalse(panel.span.isEditable())
+        self.assertEqual(panel.span.currentText(), "320 MHz")
+        expected = [2, 5, 10, 20, 40, 80, 160, 320]
+        self.assertEqual([panel.span.itemText(i) for i in range(panel.span.count())],
+                         [f"{mhz} MHz" for mhz in expected])
         for hz in (0, 8_000_000_000):
             panel.center.setText(hz)
+            self.assertEqual(panel.get_config().center_mhz, hz / 1e6)
+        for index, mhz in enumerate(expected):
+            panel.span.setCurrentIndex(index)
             config = panel.get_config()
-            self.assertEqual(config.center_mhz, hz / 1e6)
-        for hz in (0, 320_000_000):
-            panel.span.setText(hz)
-            config = panel.get_config()
-            self.page._apply_display_axes(config)
-            self.assertEqual(config.span_khz, hz / 1e3)
-        for hz in (-1, 320_000_001):
-            panel.span.setText(hz)
+            self.assertEqual(config.span_khz, mhz * 1000)
+            commands = []
+            with patch.object(self.page.controller.tcp, "send_many", commands.extend):
+                self.page.controller._apply_ffm(config)
+            self.assertIn(f"FREQuency:SPAN {float(mhz * 1000)} kHz", commands)
+        for invalid in (0, 1000, 3000, 409600):
             with self.assertRaises(ValueError):
-                panel.get_config()
-        panel.span.setText(320_000_000)
-        commands = []
-        with patch.object(self.page.controller.tcp, "send_many", commands.extend):
-            self.page.controller._apply_ffm(panel.get_config())
-        self.assertIn("FREQuency:SPAN 320000.0 kHz", commands)
+                FFMConfig(span_khz=invalid).validate()
 
     def test_user_parameter_list_and_zero_defaults(self):
         panel = self.page.panel

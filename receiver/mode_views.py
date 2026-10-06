@@ -145,6 +145,11 @@ class WaterfallPlot(pg.PlotWidget):
                        for index in range(9)]])
 
     def set_freq_range(self, start_hz, stop_hz):
+        bw = stop_hz - start_hz
+        if bw <= 0:
+            return
+        self.setLimits(xMin=start_hz, xMax=stop_hz,
+                       minXRange=max(1, bw / 16384), maxXRange=bw)
         if abs(start_hz - self._f0) < 1 and abs(stop_hz - self._f1) < 1:
             return
         self._f0, self._f1 = start_hz, stop_hz

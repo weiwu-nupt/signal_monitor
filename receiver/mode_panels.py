@@ -15,7 +15,7 @@ from PyQt6 import QtCore, QtWidgets
 from .inputs import FrequencyInput, NumberInput, NoWheelComboBox
 
 from .controller import (
-    FFMConfig, PScanConfig, FScanConfig,
+    FFMConfig, FFM_SPANS_MHZ, PScanConfig, FScanConfig,
     MScanConfig, MScanChannel, DDCConfig, DDCChannel,
 )
 
@@ -119,8 +119,9 @@ class FFMPanel(QtWidgets.QWidget):
         frequency, level, advanced = pages
         self.center = field(frequency, "中心频率", FrequencyInput(
             2_000_000_000, minimum_hz=0, maximum_hz=8_000_000_000, field_name="中心频率"))
-        self.span = field(frequency, "频谱带宽", FrequencyInput(
-            320_000_000, minimum_hz=0, maximum_hz=320_000_000, field_name="频谱带宽"))
+        self.span = combo(frequency, "频谱带宽",
+                          [(f"{mhz} MHz", float(mhz * 1000)) for mhz in FFM_SPANS_MHZ],
+                          320000.0)
         self.step = combo(frequency, "频谱步进", [(f"{x} kHz", float(x)) for x in FFM_STEPS_KHZ], 12.5)
 
         self.ref = number(level, "参考电平（dBµV）", -256, 256, 120, 1)
@@ -176,7 +177,7 @@ class FFMPanel(QtWidgets.QWidget):
     def get_config(self) -> FFMConfig:
         config = FFMConfig(
             center_mhz=self.center.value_hz() / 1e6,
-            span_khz=self.span.value_hz() / 1e3,
+            span_khz=self.span.currentData(),
             step_khz=self.step.currentData(),
             bandwidth_khz=self.bw.currentData(),
             ref_level_dbuv=self.ref.value(),

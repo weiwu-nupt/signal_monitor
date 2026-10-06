@@ -17,3 +17,8 @@ temp/
 # 系统垃圾
 Thumbs.db
 .DS_Store
+
+# Local recognition database and SQLite transaction files
+results/*.sqlite3*
+results/recognition_settings.json
+results/recognition_settings.tmp

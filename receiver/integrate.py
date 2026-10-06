@@ -78,6 +78,42 @@ class ReceiverPagesManager(QtCore.QObject):
         self.act_disconnect = m_cfg.addAction("断开接收机")
         self.act_disconnect.triggered.connect(self.controller.disconnect_receiver)
 
+        m_file = mbar.addMenu("读取文件")
+        m_file.addAction("打开 IQ 文件并循环回放…", self._open_iq_file)
+        m_file.addAction("显示文件回放", self._show_replay)
+        m_file.addAction("查看识别记录…", self._show_history)
+        m_file.addAction("返回接收机", self._show_receiver)
+        self.replay_page = None
+
+    def _show_replay(self):
+        if self.replay_page is None:
+            from .file_replay import FileReplayPage
+            self.replay_page = FileReplayPage()
+            self.stack.addWidget(self.replay_page)
+        self.stack.setCurrentWidget(self.replay_page)
+        return self.replay_page
+
+    def _open_iq_file(self):
+        page = self._show_replay()
+        if page.worker is None:
+            page.choose_file()
+        else:
+            self._flash_status("请先停止当前文件回放，再选择其他文件")
+
+    def _show_receiver(self):
+        if self.replay_page is not None:
+            self.replay_page.stop()
+        self.stack.setCurrentWidget(self.pages[RxMode.FFM])
+
+    def _show_history(self):
+        from .recognition_history import RecognitionHistoryDialog
+        from recognition_store import DEFAULT_DATABASE
+        RecognitionHistoryDialog(DEFAULT_DATABASE, self.win).exec()
+
+    def shutdown(self):
+        if self.replay_page is not None:
+            self.replay_page.shutdown()
+
     def _open_cfg_dialog(self):
         dlg = ReceiverConfigDialog(self.cfg, self.win)
         if dlg.exec() == QtWidgets.QDialog.DialogCode.Accepted:
@@ -122,6 +158,9 @@ def attach_receiver_pages(main_window, fpga_widget=None,
                           controller: ReceiverController = None):
     """安装唯一的 FFM 页面，并保留宿主提供的旧部件供后台使用。"""
     controller = controller or ReceiverController(main_window)
+    source = getattr(main_window, 'source', None)
+    if source is not None and hasattr(source, 'set_bandwidth_filter'):
+        controller.bind_recognition_source(source)
     previous = main_window.takeCentralWidget()
     if previous is not None:
         previous.setParent(main_window)
@@ -154,6 +193,7 @@ class _StandaloneWindow(QtWidgets.QMainWindow):
         self.mgr = attach_receiver_pages(self, controller=self.controller)
 
     def closeEvent(self, event):
+        self.mgr.shutdown()
         self.controller.disconnect_receiver()
         super().closeEvent(event)
 

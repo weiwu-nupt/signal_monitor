@@ -73,6 +73,7 @@ class SpectrumView(pg.PlotWidget):
         self._cur_freq: np.ndarray = np.array([])
         self._cur_spec: np.ndarray = np.array([])
         self._signal_box_items = []
+        self._previous_display_targets = []
 
         # 鼠标十字线 + 节流
         self._vline = pg.InfiniteLine(angle=90, pen=pg.mkPen("#555"))
@@ -106,18 +107,15 @@ class SpectrumView(pg.PlotWidget):
         self._wide_reference.setVisible(visible)
 
     def set_signal_boxes(self, detected_targets, selected_targets) -> None:
-        """Draw numbered occupied-band boxes; green boxes are IQ-selected."""
+        """绘制已选信号：稳定信号按频率排序，新出现信号统一置后。"""
         for item in self._signal_box_items:
             self.removeItem(item)
         self._signal_box_items.clear()
         if self._cur_freq.size == 0:
             return
         selected = set(selected_targets)
-        counters = {"wide": 0, "narrow": 0}
-        for target in detected_targets:
-            counters[target.target_type] = counters.get(target.target_type, 0) + 1
-            source_tag = "W" if target.target_type == "wide" else "N"
-            signal_id = f"{source_tag}{counters[target.target_type]}"
+        display_targets = [target for target in detected_targets if target in selected]
+        for target in self._order_display_targets(display_targets):
             left = target.center_hz - target.bandwidth_hz / 2.0
             right = target.center_hz + target.bandwidth_hz / 2.0
             mask = (self._cur_freq >= left) & (self._cur_freq <= right)
@@ -135,7 +133,7 @@ class SpectrumView(pg.PlotWidget):
             label = pg.TextItem(
                 html=(
                     f"<span style='color:{color}; font-weight:600'>"
-                    f"#{signal_id}: {target.center_hz / 1e6:.2f} MHz, "
+                    f"{target.center_hz / 1e6:.2f} MHz, "
                     f"{target.bandwidth_hz / 1e6:.2f} MHz"
                     f"{'' if is_selected else ' (filtered)'}</span>"
                 ),
@@ -146,6 +144,38 @@ class SpectrumView(pg.PlotWidget):
             label.setPos((left + right) / 2.0, top)
             self.addItem(label)
             self._signal_box_items.extend((rect, label))
+
+    def _order_display_targets(self, targets):
+        """稳定目标优先；稳定目标和新目标各自均按中心频率升序排列。"""
+        previous = list(self._previous_display_targets)
+        stable, unstable = [], []
+        for target in targets:
+            match_index = self._matching_previous_target(target, previous)
+            if match_index is None:
+                unstable.append(target)
+            else:
+                stable.append(target)
+                previous.pop(match_index)
+        self._previous_display_targets = list(targets)
+        return (sorted(stable, key=lambda item: item.center_hz)
+                + sorted(unstable, key=lambda item: item.center_hz))
+
+    @staticmethod
+    def _matching_previous_target(target, previous):
+        """返回同一稳定信号在上一帧的位置，避免按检测强度导致顺序跳变。"""
+        candidates = []
+        for index, old in enumerate(previous):
+            if target.target_type != old.target_type:
+                continue
+            narrowest = min(target.bandwidth_hz, old.bandwidth_hz)
+            widest = max(target.bandwidth_hz, old.bandwidth_hz)
+            if narrowest <= 0 or widest > narrowest * 2:
+                continue
+            tolerance_hz = max(1_000_000.0, narrowest * 0.1)
+            distance_hz = abs(target.center_hz - old.center_hz)
+            if distance_hz <= tolerance_hz:
+                candidates.append((distance_hz, index))
+        return min(candidates)[1] if candidates else None
 
     def set_maxhold(self, enabled: bool) -> None:
         self._maxhold.setVisible(enabled)
