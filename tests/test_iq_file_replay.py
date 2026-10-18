@@ -12,7 +12,8 @@ from PyQt6 import QtWidgets
 from iq_file_source import (inspect_iq_file, IQReplayReader, spectrum_power,
                             extract_channel, detect_signals)
 from fpga_closed_loop import EnergyDetector
-from receiver.file_replay import FileReplayPage
+from receiver.file_replay import FileReplayPage, smooth_spectrum
+from receiver.recognition_history import RecordedSpectrumDialog
 
 
 def write_rf64(path, raw, rate=320000):
@@ -67,6 +68,41 @@ class FileTests(unittest.TestCase):
         self.assertTrue(a)
         self.assertEqual(a[0].center_hz, b[0].center_hz)
         self.assertGreater(a[0].center_hz, 30e6)
+
+    def test_display_smoothing_preserves_length_and_reduces_single_bin_spike(self):
+        source = np.array([-80, -80, -20, -80, -80], dtype=np.float32)
+        smoothed = smooth_spectrum(source, 3)
+        self.assertEqual(smoothed.shape, source.shape)
+        self.assertLess(smoothed[2], source[2])
+        self.assertGreater(smoothed[2], source[1])
+        np.testing.assert_array_equal(smooth_spectrum(source, 1), source)
+
+    def test_recorded_spectrum_replay_reads_saved_source_position(self):
+        app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+        with tempfile.TemporaryDirectory() as directory:
+            samples = np.zeros((6400, 2), dtype=np.int16)
+            samples[:, 0] = 1000
+            packet = Path(directory) / 'iq_packets' / 'packet-1.npz'
+            packet.parent.mkdir()
+            np.savez_compressed(packet, iq=samples, sample_rate_hz=np.int64(320000))
+            dialog = RecordedSpectrumDialog({
+                'center_hz': 700100000.0, 'bandwidth_hz': 100000,
+                'iq_path': 'iq_packets/packet-1.npz',
+            }, directory)
+            try:
+                frequency, values = dialog.curve.getData()
+                self.assertEqual(len(frequency), len(values))
+                self.assertEqual(len(frequency), 32768)
+                self.assertAlmostEqual(sum(dialog.band.getRegion()) / 2, 700100000.0)
+                self.assertEqual(dialog.frame_count, 2)
+                before = dialog.plot.getViewBox().viewRange()
+                dialog.next_button.click()
+                self.assertEqual(dialog.frame_slider.value(), 1)
+                self.assertIn('第 2/2 帧', dialog.frame_label.text())
+                self.assertEqual(dialog.plot.getViewBox().viewRange(), before)
+            finally:
+                dialog.close()
+                app.processEvents()
 
     def test_page_worker_pause_stop_and_restart(self):
         app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])

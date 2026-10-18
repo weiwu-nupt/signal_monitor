@@ -68,6 +68,28 @@ class SignalRegionTests(unittest.TestCase):
         targets = self.detect(power)
         self.assertTrue(any(t.bandwidth_hz >= 15e6 for t in targets))
 
+    def test_raised_valley_groups_multicarrier_file_signal(self):
+        power = self.signal()
+        # Three 2 MHz carriers, 18 MHz apart.  The valley is weak compared
+        # with a carrier but is still a real occupied envelope, not a quiet
+        # channel gap; file replay should therefore collect it once.
+        for left, right in ((600, 800), (2600, 2800), (4600, 4800)):
+            power[left:right] = 1e-5
+        power[800:2600] = 3e-9
+        power[2800:4600] = 3e-9
+        grouped = EnergyDetector(smoothing=0, component_merge_gap_hz=25e6).detect(
+            power, 0, self.fs, 'narrow', self.count)
+        self.assertEqual(len(grouped), 1)
+        self.assertAlmostEqual(grouped[0].bandwidth_hz, 42e6, delta=10e3)
+
+        # The same carrier spacing must stay separate across a noise-only gap.
+        quiet = self.signal()
+        for left, right in ((600, 800), (2600, 2800), (4600, 4800)):
+            quiet[left:right] = 1e-5
+        separate = EnergyDetector(smoothing=0, component_merge_gap_hz=25e6).detect(
+            quiet, 0, self.fs, 'narrow', self.count)
+        self.assertEqual(len(separate), 3)
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -73,8 +73,13 @@ class ReplayPersistenceTests(unittest.TestCase):
             self.assertEqual(state['tracks'][0].identifier, 1)
             store = RecognitionStore(worker.database_path)
             try:
-                packet = store.connection.execute('SELECT signal_id,frame,source_start_sample,sample_rate_hz FROM packets').fetchone()
-                self.assertEqual(packet, (1, 1, 3200000, 4000000))
+                packet = store.connection.execute(
+                    'SELECT signal_id,frame,source_start_sample,sample_rate_hz,iq_path FROM packets').fetchone()
+                self.assertEqual(packet[:4], (1, 1, 3200000, 4000000))
+                self.assertTrue(packet[4])
+                with np.load(worker.database_path.parent / packet[4], allow_pickle=False) as saved:
+                    self.assertEqual(saved['iq'].shape, (IQ_PACKET_SAMPLES, 2))
+                    self.assertEqual(int(saved['sample_rate_hz']), 4000000)
                 self.assertEqual(store.connection.execute('SELECT count(*) FROM windows').fetchone()[0], 2)
             finally:
                 store.close()
