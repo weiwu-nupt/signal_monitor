@@ -5,7 +5,10 @@ class PacketRecognitionPipeline:
 
     def recognize_iq(self, iq, sample_rate_hz, metadata, **kwargs):
         result = self.recognizer.infer_packet_iq(iq, sample_rate_hz, **kwargs)
-        packet_id = self.store.save(self.session_id, result, metadata)
+        # Keep the exact post-DDC, resampled packet so history replay is the
+        # spectrum the model actually saw, never a fresh FFT of the wideband
+        # source file.
+        packet_id = self.store.save(self.session_id, result, metadata, iq)
         return result, packet_id
 
     def recognize_fpga_packet(self, packet, metadata, **kwargs):

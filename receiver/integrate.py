@@ -80,7 +80,6 @@ class ReceiverPagesManager(QtCore.QObject):
 
         m_file = mbar.addMenu("读取文件")
         m_file.addAction("打开 IQ 文件并循环回放…", self._open_iq_file)
-        m_file.addAction("显示文件回放", self._show_replay)
         m_file.addAction("查看识别记录…", self._show_history)
         m_file.addAction("返回接收机", self._show_receiver)
         self.replay_page = None

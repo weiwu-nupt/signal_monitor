@@ -2,9 +2,12 @@
 from datetime import datetime, timezone
 import hashlib
 import json
+import os
 from pathlib import Path
 import sqlite3
 import uuid
+
+import numpy as np
 
 DEFAULT_DATABASE = Path(__file__).resolve().parent / 'results' / 'recognition.sqlite3'
 
@@ -48,7 +51,8 @@ class RecognitionStore:
                     vote_fraction REAL NOT NULL, image_count INTEGER NOT NULL,
                     tied INTEGER NOT NULL, window_ms REAL NOT NULL, nfft INTEGER NOT NULL,
                     votes_json TEXT NOT NULL, probabilities_json TEXT NOT NULL,
-                    metadata_json TEXT NOT NULL
+                    metadata_json TEXT NOT NULL,
+                    iq_path TEXT
                 );
                 CREATE TABLE IF NOT EXISTS windows (
                     packet_id INTEGER NOT NULL REFERENCES packets(id) ON DELETE CASCADE,
@@ -60,6 +64,9 @@ class RecognitionStore:
                 CREATE INDEX IF NOT EXISTS packets_signal ON packets(session_id,signal_id,id);
                 CREATE INDEX IF NOT EXISTS packets_frequency ON packets(center_hz,created_utc);
             ''')
+            columns = {row[1] for row in self.connection.execute('PRAGMA table_info(packets)')}
+            if 'iq_path' not in columns:
+                self.connection.execute('ALTER TABLE packets ADD COLUMN iq_path TEXT')
         except BaseException:
             self.connection.close()
             raise
@@ -73,7 +80,25 @@ class RecognitionStore:
                  str(model_path), digest, _json(settings)))
         return identifier
 
-    def save(self, session_id, result, metadata):
+    def _save_resampled_iq(self, packet_id, iq, sample_rate_hz):
+        """Persist the exact DDC/resampled IQ behind a packet record."""
+        if hasattr(iq, 'detach'):
+            iq = iq.detach().to('cpu').numpy()
+        iq = np.ascontiguousarray(np.asarray(iq))
+        if iq.ndim != 2 or iq.shape[1] != 2 or iq.dtype != np.int16:
+            raise ValueError('保存的重采样IQ必须为 Nx2 int16')
+        relative = Path('iq_packets') / f'packet-{packet_id}.npz'
+        target = self.path.parent / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        temporary = target.with_suffix('.tmp.npz')
+        np.savez_compressed(temporary, iq=iq, sample_rate_hz=np.int64(sample_rate_hz))
+        os.replace(temporary, target)
+        with self.connection:
+            self.connection.execute('UPDATE packets SET iq_path=? WHERE id=?',
+                                    (str(relative), packet_id))
+        return str(relative)
+
+    def save(self, session_id, result, metadata, iq=None):
         if not result.windows:
             raise ValueError('packet has no per-image results')
         values = (session_id, datetime.now(timezone.utc).isoformat(),
@@ -98,6 +123,8 @@ class RecognitionStore:
             self.connection.executemany('INSERT INTO windows VALUES (?,?,?,?,?,?,?)',
                 ((packet_id, i, w.start_sample, w.sample_count, w.class_name,
                   w.confidence, _json(w.probabilities)) for i, w in enumerate(result.windows, 1)))
+        if iq is not None:
+            self._save_resampled_iq(packet_id, iq, result.sample_rate_hz)
         return packet_id
 
     def recent(self, limit=200):

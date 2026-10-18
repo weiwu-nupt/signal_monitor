@@ -419,6 +419,7 @@ class EnergyDetector:
         relative_guard: float = 0.10,
         max_guard_hz: float = 2_000_000.0,
         merge_gap_hz: float = 12_500.0,
+        component_merge_gap_hz: float = 0.0,
         min_bins: int = 2,
         smoothing: float = 0.65,
         occupied_bandwidth_percent: float = 0.99,
@@ -430,6 +431,7 @@ class EnergyDetector:
             or not 0 <= relative_guard <= 1
             or max_guard_hz < min_guard_hz
             or merge_gap_hz < 0
+            or component_merge_gap_hz < 0
             or min_bins < 1
             or not 0.5 < occupied_bandwidth_percent < 1.0
             or wide_min_bandwidth_hz <= 0
@@ -442,6 +444,10 @@ class EnergyDetector:
         self.relative_guard = relative_guard
         self.max_guard_hz = max_guard_hz
         self.merge_gap_hz = merge_gap_hz
+        # Zero preserves the receiver's normal, carrier-by-carrier mode.
+        # File replay can opt into grouping components whose inter-carrier
+        # valley is demonstrably above the global noise floor.
+        self.component_merge_gap_hz = component_merge_gap_hz
         self.min_bins = min_bins
         self.smoothing = smoothing
         self.occupied_bandwidth_percent = occupied_bandwidth_percent
@@ -592,6 +598,29 @@ class EnergyDetector:
                                          int(np.ceil(self.merge_gap_hz / bin_hz))):
                 if stop-start+1 >= self.min_bins:
                     measured.append((left+start, left+stop))
+        # A modulated emission can present several tall carriers with a raised
+        # valley between them.  The narrow threshold deliberately resolves the
+        # individual carriers, then this optional pass restores one occupied
+        # signal only when the bridge itself is real energy (not quiet space).
+        if self.component_merge_gap_hz:
+            clustered = []
+            bridge_level = noise_floor_db + max(6.0, snr_db)
+            for left, right in sorted(measured):
+                if clustered:
+                    previous_left, previous_right = clustered[-1]
+                    gap = left - previous_right - 1
+                    gap_hz = gap * bin_hz
+                    if 0 < gap_hz <= self.component_merge_gap_hz:
+                        bridge = levels_db[previous_right + 1:left]
+                        # Use the upper part of the bridge: it admits a shaped
+                        # emission with ripple, while a noise-only channel gap
+                        # remains below this level.
+                        if bridge.size and float(np.percentile(bridge, 75)) >= bridge_level:
+                            clustered[-1] = (previous_left, right)
+                            continue
+                clustered.append((left, right))
+            measured = clustered
+
         candidates = []
         for left, right in measured:
             # FFT values live at bin centres. Symmetric half-bin edges make

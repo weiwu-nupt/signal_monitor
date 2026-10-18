@@ -15,6 +15,7 @@ from recognition_schedule import target_batches, classify_target
 from fpga_closed_loop import TargetFilter
 from .recognition_controls import RecognitionBandwidth
 from .mode_views import WaterfallPlot
+from .ffm_spectrum import TraceProcessor
 from signal_tracks import SignalTracker
 from ddc_rates import prepare_targets
 from dataclasses import replace
@@ -44,6 +45,7 @@ class ReplayWorker:
         self._round_busy = False
         # 当前识别轮在 t0 冻结的信号 ID。None 仅用于尚未启动轮次时。
         self._round_ids = None
+        self._round_display_targets = None
         self._scheduled_ids = {}
         self._active_batch = 0
         self._round_finished = threading.Event()
@@ -98,7 +100,8 @@ class ReplayWorker:
                                    if identifier in self.tracker.tracks]
                 value = {**value,
                          'targets': [track.target for track in snapshot_tracks],
-                         'rows': [list(track.row) for track in snapshot_tracks]}
+                         'rows': [list(track.row) for track in snapshot_tracks],
+                         'display_targets': self._round_display_targets or value.get('display_targets', [])}
             else:
                 rows = [list(self.tracker.tracks[self.tracker.identifier_for(t)].row)
                         if self.tracker.identifier_for(t) in self.tracker.tracks else list(row)
@@ -157,6 +160,7 @@ class ReplayWorker:
             self._round_finished.clear()
             self._round_busy = False
             self._round_ids = None
+            self._round_display_targets = None
 
     def _recognize_rounds(self, recognizer):
         """Keep SQLite and slow DDC/inference on this thread, outside playback."""
@@ -334,7 +338,11 @@ class ReplayWorker:
                 model_status += (' | '+(f'自动窗口，{self.image_window_ms:g} ms起步，最多{self.max_images_per_packet}图/包'
                     if self.max_images_per_packet else f'固定窗口{self.image_window_ms:g} ms/图')
                     +f' | 数据库：{self.database_path}')
-            detector = EnergyDetector(snr_db=self.threshold)
+            # File recordings often contain multi-carrier/modulated emissions:
+            # retain one target when their valley remains above the measured
+            # noise floor, instead of issuing one IQ capture per carrier.
+            detector = EnergyDetector(snr_db=self.threshold,
+                                      component_merge_gap_hz=25_000_000)
             reader = IQReplayReader(self.info)
             frame = 0
             while not self.cancel.is_set():
@@ -343,11 +351,11 @@ class ReplayWorker:
                 tick = time.monotonic()
                 raw, start = reader.read()
                 power = spectrum_power(raw)
-                targets = detect_signals(power, self.info.sample_rate, self.usable, detector)
-                targets = [classify_target(t) for t in targets]
-                detected_count = len(targets)
+                detected_targets = detect_signals(power, self.info.sample_rate, self.usable, detector)
+                detected_targets = [classify_target(t) for t in detected_targets]
+                detected_count = len(detected_targets)
                 frame_filter, frame_multiplier = self.bandwidth_filter, self.rate_multiplier
-                targets, rejected = prepare_targets(targets, self.info.sample_rate, frame_multiplier)
+                targets, rejected = prepare_targets(detected_targets, self.info.sample_rate, frame_multiplier)
                 batches = target_batches(targets, frame_filter)
                 assignments = {(t.target_type, t.center_hz, t.bandwidth_hz): batch_index
                                for batch_index, batch in enumerate(batches, 1) for t in batch}
@@ -367,6 +375,11 @@ class ReplayWorker:
                              model_error=model_error,
                              source_start_sample=start,
                              db=10*np.log10(np.maximum(power, 1e-20)),
+                             # Mark every detected occupied interval in the
+                             # spectrum, including one that cannot yet be
+                             # sampled at 3x its width.  Scheduling remains
+                             # limited to ``targets`` below.
+                             display_targets=detected_targets,
                              targets=targets, rows=rows,
                              status=f'{self.info.path.name} | 第 {reader.cycle} 轮 | '
                                     f'{start/self.info.sample_rate:.3f} / '
@@ -382,6 +395,7 @@ class ReplayWorker:
                     self._scheduled_ids = {identifier: index
                         for index, batch in enumerate(frozen, 1) for _, identifier in batch}
                     self._round_ids = tuple(self._scheduled_ids)
+                    self._round_display_targets = tuple(detected_targets)
                     self._active_batch = 0
                     self._jobs.put_nowait(dict(batches=frozen, start=start, frame=frame,
                         cycle=reader.cycle, filter=frame_filter, multiplier=frame_multiplier))
@@ -427,9 +441,26 @@ class SpectrumBandsItem(pg.GraphicsObject):
         return self._bounds
 
     def paint(self, painter, option, widget=None):
-        painter.setPen(pg.mkPen(70, 180, 230, 70))
-        painter.setBrush(pg.mkBrush(70, 180, 230, 25))
+        # Marks are deliberately subtle: they locate a detected channel but
+        # must not obscure weak detail in the spectrum underneath.
+        painter.setPen(pg.mkPen(70, 180, 230, 120))
+        painter.setBrush(pg.mkBrush(70, 180, 230, 10))
         painter.drawPath(self._path)
+
+
+def smooth_spectrum(values, window: int) -> np.ndarray:
+    """Return an edge-preserving moving average for display only."""
+    values = np.asarray(values, dtype=np.float32)
+    window = max(1, int(window))
+    if window <= 1 or values.size < 3:
+        return values.copy()
+    window = min(window | 1, values.size if values.size % 2 else values.size - 1)
+    if window <= 1:
+        return values.copy()
+    half = window // 2
+    padded = np.pad(values, (half, half), mode='edge')
+    kernel = np.full(window, 1.0 / window, dtype=np.float32)
+    return np.convolve(padded, kernel, mode='valid').astype(np.float32, copy=False)
 
 
 class FileReplayPage(QtWidgets.QWidget):
@@ -448,6 +479,9 @@ class FileReplayPage(QtWidgets.QWidget):
         self._tracker = SignalTracker()
         self._table_last_update = 0.0
         self._table_ids = []
+        self._trace = TraceProcessor()
+        self._trace_axis = np.empty(0, dtype=np.float64)
+        self._trace_raw = np.empty(0, dtype=np.float32)
         layout = QtWidgets.QVBoxLayout(self)
         bar = QtWidgets.QHBoxLayout()
         self.open_button = QtWidgets.QPushButton('选择 IQ 文件…')
@@ -469,8 +503,34 @@ class FileReplayPage(QtWidgets.QWidget):
         bar.addStretch()
         self.show_waterfall = QtWidgets.QCheckBox('显示瀑布图')
         bar.addWidget(self.show_waterfall)
+        bar.addSpacing(12)
+        bar.addWidget(QtWidgets.QLabel('频谱迹线'))
+        self.trace_mode = QtWidgets.QComboBox()
+        self.trace_mode.addItems(('实时', '最小保持', '最大保持'))
+        self.trace_mode.setToolTip('只影响上方频谱显示；不会影响信号检测、采集或瀑布图。')
+        bar.addWidget(self.trace_mode)
+        bar.addWidget(QtWidgets.QLabel('平滑'))
+        self.trace_smoothing = QtWidgets.QSpinBox()
+        self.trace_smoothing.setRange(1, 101)
+        self.trace_smoothing.setSingleStep(2)
+        self.trace_smoothing.setValue(1)
+        self.trace_smoothing.setSuffix(' 点')
+        self.trace_smoothing.setToolTip('频谱显示的移动平均窗口；1 点表示关闭平滑。')
+        bar.addWidget(self.trace_smoothing)
+        self.clear_trace_button = QtWidgets.QPushButton('清除保持')
+        self.clear_trace_button.setToolTip('清空最小/最大保持的历史，并从下一帧重新累计。')
+        bar.addWidget(self.clear_trace_button)
         bar.addWidget(self.auto_adjust_button)
         layout.addLayout(bar)
+        # Keep the parameter block independently resizable.  The controls used
+        # to consume a fixed amount of height above the spectrum, particularly
+        # on wide displays; a vertical splitter lets it collapse when viewing
+        # fine spectrum detail is the priority.
+        self.replay_splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Vertical)
+        self.replay_splitter.setChildrenCollapsible(True)
+        self.replay_settings_panel = QtWidgets.QWidget()
+        settings_panel_layout = QtWidgets.QVBoxLayout(self.replay_settings_panel)
+        settings_panel_layout.setContentsMargins(0, 0, 0, 0)
         settings = QtWidgets.QHBoxLayout()
         self.center = QtWidgets.QDoubleSpinBox()
         self.center.setRange(0, 100000)
@@ -506,12 +566,12 @@ class FileReplayPage(QtWidgets.QWidget):
         settings.addWidget(self.auto_image_window)
         settings.addWidget(self.max_images)
         settings.addStretch()
-        layout.addLayout(settings)
+        settings_panel_layout.addLayout(settings)
         self.nn_status = QtWidgets.QLabel('神经网络未启用：尚未选择训练权重。请点击“加载识别模型”。')
         self.nn_status.setWordWrap(True)
         self.nn_status.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
         self.nn_status.setStyleSheet('color: #ffd166; font-weight: 600;')
-        layout.addWidget(self.nn_status)
+        settings_panel_layout.addWidget(self.nn_status)
         if self.checkpoint:
             self.model_button.setText(Path(self.checkpoint).name)
             prefix = '已记住权重' if remembered else '已自动找到sigRec模型'
@@ -520,10 +580,10 @@ class FileReplayPage(QtWidgets.QWidget):
         self.recognition_bandwidth = RecognitionBandwidth()
         self.recognition_bandwidth.changed.connect(self._recognition_filter_changed)
         self.recognition_bandwidth.rateMultiplierChanged.connect(self._rate_multiplier_changed)
-        layout.addWidget(self.recognition_bandwidth)
+        settings_panel_layout.addWidget(self.recognition_bandwidth)
         self.description = QtWidgets.QLabel('请选择 RF64/WAVE 文件。每帧读取 10 ms IQ，按处理速度循环回放。')
         self.description.setWordWrap(True)
-        layout.addWidget(self.description)
+        settings_panel_layout.addWidget(self.description)
         split = QtWidgets.QSplitter(QtCore.Qt.Orientation.Vertical)
         self.spectrum = pg.PlotWidget()
         self.spectrum.enableAutoRange(x=False, y=False)
@@ -555,7 +615,12 @@ class FileReplayPage(QtWidgets.QWidget):
         split.setSizes([400, 230, 190])
         self.waterfall.hide()
         self.show_waterfall.toggled.connect(self.waterfall.setVisible)
-        layout.addWidget(split, 1)
+        self.replay_splitter.addWidget(self.replay_settings_panel)
+        self.replay_splitter.addWidget(split)
+        self.replay_splitter.setStretchFactor(0, 0)
+        self.replay_splitter.setStretchFactor(1, 1)
+        self.replay_splitter.setSizes([170, 830])
+        layout.addWidget(self.replay_splitter, 1)
         self.status = QtWidgets.QLabel('未加载模型：可先查看频谱和检测频段；分类需要兼容的 ResNet 权重及 CUDA。')
         self.status.setWordWrap(True)
         layout.addWidget(self.status)
@@ -567,10 +632,40 @@ class FileReplayPage(QtWidgets.QWidget):
         self.stop_button.clicked.connect(self.stop)
         self.pause_button.toggled.connect(self.pause)
         self.auto_adjust_button.clicked.connect(self.auto_adjust)
+        self.trace_mode.currentTextChanged.connect(self._trace_mode_changed)
+        self.trace_smoothing.valueChanged.connect(self._trace_smoothing_changed)
+        self.clear_trace_button.clicked.connect(self._clear_trace_hold)
         self.timer = QtCore.QTimer(self)
         self.timer.timeout.connect(self.poll)
         self.timer.start(50)
         self._set_running(False)
+
+    def _trace_mode_changed(self, mode):
+        self._trace.configure(mode)
+        self._redraw_trace()
+
+    def _trace_smoothing_changed(self, _value):
+        self._redraw_trace(reseed=True)
+
+    def _clear_trace_hold(self):
+        self._trace.reset()
+        self._redraw_trace(reseed=True)
+
+    def _redraw_trace(self, reseed=False):
+        if not self._trace_raw.size:
+            return
+        if reseed:
+            self._trace.reset()
+        values = smooth_spectrum(self._trace_raw, self.trace_smoothing.value())
+        self.curve.setData(self._trace_axis, self._trace.apply(values))
+
+    def _update_trace(self, axis, values):
+        axis = np.asarray(axis, dtype=np.float64)
+        values = np.asarray(values, dtype=np.float32)
+        if not np.array_equal(axis, self._trace_axis):
+            self._trace.reset()
+        self._trace_axis, self._trace_raw = axis.copy(), values.copy()
+        self._redraw_trace()
 
     def _set_running(self, running):
         for control in (self.open_button, self.center, self.band, self.threshold, self.image_window,
@@ -675,6 +770,9 @@ class FileReplayPage(QtWidgets.QWidget):
         self._table_ids = []
         self.recognition_bandwidth.current = selected_filter
         self.curve.setData([], [])
+        self._trace.reset()
+        self._trace_axis = np.empty(0, dtype=np.float64)
+        self._trace_raw = np.empty(0, dtype=np.float32)
         self.table.setRowCount(0)
         self._clear_regions()
         self.waterfall.clear_history()
@@ -761,15 +859,19 @@ class FileReplayPage(QtWidgets.QWidget):
     def _render_targets(self, state, force_table=False):
         visible = [(target, row) for target, row in zip(state['targets'], state['rows'])
                    if self.recognition_bandwidth.current.allows(target)]
-        targets = tuple(target for target, _ in visible)
+        display_targets = tuple(target for target in state.get('display_targets', state['targets'])
+                                if self.recognition_bandwidth.current.allows(target))
         now = time.monotonic()
-        if targets != self._visible_targets and (force_table or now-self._regions_last_update >= .25):
+        if display_targets != self._visible_targets and (force_table or now-self._regions_last_update >= .25):
             bands = []
-            for target in targets:
+            for target in display_targets:
                 center = state['center'] + target.center_hz
+                # These are the measured occupied edges, not a scaled display
+                # approximation.  The fill is intentionally almost invisible
+                # so exact-width marks do not hide fine spectral detail.
                 bands.append((center-target.bandwidth_hz/2, center+target.bandwidth_hz/2))
             self._band_item.set_bands(bands)
-            self._visible_targets = targets
+            self._visible_targets = display_targets
             self._regions_last_update = now
         axis = state['axis']
         bin_hz = abs(float(axis[1]-axis[0])) if len(axis) > 1 else 1.0
@@ -842,7 +944,7 @@ class FileReplayPage(QtWidgets.QWidget):
             self.status.setText(state.get('error', state.get('status', '')))
             if 'frame' in state:
                 if self._frame != state['frame']:
-                    self.curve.setData(state['axis'], state['db'])
+                    self._update_trace(state['axis'], state['db'])
                     if self._frame is None:
                         # Seed once per playback; subsequent frames keep the
                         # scale until the user explicitly requests adjustment.
