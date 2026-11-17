@@ -232,12 +232,12 @@ class AsyncReplayTests(unittest.TestCase):
             worker.thread.start()
             try:
                 self.assertTrue(entered.wait(5))
-                self.assertTrue(wait_until(lambda: len(read_frames) >= 4))
-                deadline = time.monotonic()+5
+                time.sleep(.25)
+                # A closed loop holds t0; the next reader call is forbidden
+                # until all frozen targets for this round are processed.
+                self.assertEqual(len(read_frames), 1)
                 state = worker.mailbox.get(timeout=1)
-                while state['frame'] < 4 and time.monotonic() < deadline:
-                    state = worker.mailbox.get(timeout=1)
-                self.assertGreaterEqual(state['frame'], 4)
+                self.assertEqual(state['frame'], 1)
                 self.assertEqual(state['tracks'][0].row[8], '采集 25.0%')
                 self.assertEqual(len(collected), 1)
                 self.assertTrue(worker._round_busy)

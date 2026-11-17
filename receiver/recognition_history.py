@@ -1,22 +1,21 @@
 """Read-only view of persisted packet classifications and individual votes."""
 from datetime import datetime
 import json
-from pathlib import Path
-import sqlite3
 
 import numpy as np
 import pyqtgraph as pg
 from PyQt6 import QtCore, QtWidgets
 
 from iq_file_source import spectrum_power
+from recognition_store import RecognitionStore
 
 
 class RecordedSpectrumDialog(QtWidgets.QDialog):
     """Replay the stored post-DDC IQ spectrum for one recognition record."""
-    def __init__(self, record, iq_root, parent=None):
+    def __init__(self, record, store, parent=None):
         super().__init__(parent)
         self.record = record
-        self.iq_root = Path(iq_root)
+        self.store = store
         self.raw_iq = None
         self.sample_rate = 0
         self.frame_samples = 0
@@ -67,24 +66,8 @@ class RecordedSpectrumDialog(QtWidgets.QDialog):
         self.load_spectrum()
 
     def load_spectrum(self):
-        relative = self.record.get('iq_path')
-        if not relative:
-            self.status.setText('该记录没有保存重采样 IQ，无法频谱回放。旧格式记录已不支持回放。')
-            self.curve.setData([], [])
-            self.band.hide()
-            self.raw_iq = None
-            return
-        saved_iq = self.iq_root / relative
-        if not saved_iq.is_file():
-            self.status.setText(f'保存的重采样 IQ 文件不存在。\n{saved_iq}')
-            self.curve.setData([], [])
-            self.band.hide()
-            self.raw_iq = None
-            return
         try:
-            with np.load(saved_iq, allow_pickle=False) as saved:
-                self.raw_iq = np.asarray(saved['iq'], dtype=np.int16)
-                self.sample_rate = int(saved['sample_rate_hz'])
+            self.raw_iq, self.sample_rate = self.store.load_iq(self.record['id'])
             self.frame_samples = max(1, round(self.sample_rate*.01))
             self.frame_count = int(np.ceil(len(self.raw_iq) / self.frame_samples))
             self.frame_slider.blockSignals(True)
@@ -95,7 +78,7 @@ class RecordedSpectrumDialog(QtWidgets.QDialog):
             self.band.setRegion((self.record['center_hz']-half, self.record['center_hz']+half))
             self.band.show()
             self._show_frame(0, reset_range=True)
-        except (OSError, ValueError, KeyError) as exc:
+        except Exception as exc:
             self.status.setText(f'无法回放该记录的频谱：{exc}')
             self.curve.setData([], [])
             self.band.hide()
@@ -147,12 +130,13 @@ class RecordedSpectrumDialog(QtWidgets.QDialog):
 class RecognitionHistoryDialog(QtWidgets.QDialog):
     def __init__(self, path, parent=None):
         super().__init__(parent)
-        self.path = Path(path)
+        self.path = path
+        self.store = None
         self.records = []
         self.setWindowTitle('识别记录')
         self.resize(1400, 750)
         layout = QtWidgets.QVBoxLayout(self)
-        self.status = QtWidgets.QLabel(str(self.path))
+        self.status = QtWidgets.QLabel(str(path))
         self.status.setWordWrap(True)
         layout.addWidget(self.status)
         self.table = QtWidgets.QTableWidget(0, 10)
@@ -180,17 +164,11 @@ class RecognitionHistoryDialog(QtWidgets.QDialog):
         self.refresh()
 
     def query(self, sql, parameters=()):
-        connection = sqlite3.connect(self.path.resolve().as_uri()+'?mode=ro', uri=True, timeout=5)
-        try:
-            connection.row_factory = sqlite3.Row
-            return [dict(r) for r in connection.execute(sql, parameters)]
-        finally:
-            connection.close()
+        if self.store is None:
+            self.store = RecognitionStore(self.path)
+        return self.store.query(sql, parameters)
 
     def refresh(self):
-        if not self.path.exists():
-            self.status.setText(f'尚无识别记录。加载模型并完成识别后保存至：{self.path}')
-            return
         try:
             records = self.query('''SELECT p.*, s.source, s.settings_json FROM packets p
                 JOIN sessions s ON s.id=p.session_id ORDER BY p.id DESC LIMIT 200''')
@@ -200,7 +178,9 @@ class RecognitionHistoryDialog(QtWidgets.QDialog):
             self.table.setRowCount(len(records))
             for index, record in enumerate(records):
                 values = [str(record['id']),
-                    datetime.fromisoformat(record['created_utc']).astimezone().strftime('%m-%d %H:%M:%S'),
+                    (record['created_utc'].astimezone().strftime('%m-%d %H:%M:%S')
+                     if isinstance(record['created_utc'], datetime) else
+                     datetime.fromisoformat(record['created_utc']).astimezone().strftime('%m-%d %H:%M:%S')),
                     f"S{record['signal_id']:04d}" if record['signal_id'] is not None else '—',
                     f"{record['center_hz']/1e6:.3f}", f"{record['bandwidth_hz']/1e6:.3f}",
                     f"{record['sample_rate_hz']/1e6:.6f}", record['class_name'],
@@ -210,8 +190,8 @@ class RecognitionHistoryDialog(QtWidgets.QDialog):
                     item = QtWidgets.QTableWidgetItem(value)
                     item.setToolTip(value)
                     self.table.setItem(index, column, item)
-            self.status.setText(f'最近 {len(records)} 条记录（每个4 MiB包一条，最新在前） | {self.path}')
-        except (sqlite3.Error, ValueError) as exc:
+            self.status.setText(f'最近 {len(records)} 条记录（每个4 MiB包一条，最新在前）')
+        except Exception as exc:
             self.status.setText(f'读取记录失败：{exc}')
 
     def show_details(self):
@@ -221,7 +201,8 @@ class RecognitionHistoryDialog(QtWidgets.QDialog):
         record = self.records[row]
         try:
             windows = self.query('SELECT * FROM windows WHERE packet_id=? ORDER BY image_index', (record['id'],))
-            votes = json.loads(record['votes_json'])
+            votes = (json.loads(record['votes_json']) if isinstance(record['votes_json'], str)
+                     else record['votes_json'])
             text = [f"会话：{record['session_id']}  | 来源：{record['source']}",
                 f"投票：{votes}  | {record['window_ms']:g} ms/图  | FFT：{record['nfft']}",
                 '模型置信度为最终类别在所有图上的平均得分；多数票占比为该类别的票数/图像数。']
@@ -233,7 +214,7 @@ class RecognitionHistoryDialog(QtWidgets.QDialog):
                     f"{window['class_name']} {window['confidence']:.1%} | "
                     f"{window['probabilities_json']}")
             self.details.setPlainText('\n'.join(text))
-        except (sqlite3.Error, ValueError) as exc:
+        except Exception as exc:
             self.details.setPlainText(f'读取投票明细失败：{exc}')
 
     def replay_spectrum(self):
@@ -241,4 +222,9 @@ class RecognitionHistoryDialog(QtWidgets.QDialog):
         if not 0 <= row < len(self.records):
             self.status.setText('请先选择一条识别记录，再进行频谱回放。')
             return
-        RecordedSpectrumDialog(self.records[row], self.path.parent, self).exec()
+        RecordedSpectrumDialog(self.records[row], self.store, self).exec()
+
+    def closeEvent(self, event):
+        if self.store is not None:
+            self.store.close()
+        super().closeEvent(event)

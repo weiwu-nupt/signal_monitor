@@ -91,13 +91,9 @@ class SignalTracker:
     def visible(self, selected_filter):
         return sorted((track for track in self.tracks.values()
                        if selected_filter.allows(track.target)),
-                      # 连续检出的稳定信号保持在前面并按频率排序；刚出现、
-                      # 短暂漏检或尚未稳定的信号统一收在列表末尾。
-                      key=lambda track: (
-                          not (track.observed_frames >= 2 and track.missed == 0),
-                          track.target.center_hz,
-                          track.identifier,
-                      ))
+                      # The visible sequence is the frequency map used by
+                      # both the table and the spectrum click selection.
+                      key=lambda track: (track.target.center_hz, track.identifier))
 
     def identifier_for(self, target):
         return self._assignments.get(self.key(target))

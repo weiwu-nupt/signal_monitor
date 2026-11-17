@@ -74,6 +74,8 @@ class ReceiverPagesManager(QtCore.QObject):
         m_cfg = mbar.addMenu("参数配置")
         act_rx = m_cfg.addAction("接收机配置...")
         act_rx.triggered.connect(self._open_cfg_dialog)
+        act_database = m_cfg.addAction("PostgreSQL 数据库设置…")
+        act_database.triggered.connect(self._open_database_settings)
 
         self.act_disconnect = m_cfg.addAction("断开接收机")
         self.act_disconnect.triggered.connect(self.controller.disconnect_receiver)
@@ -106,8 +108,12 @@ class ReceiverPagesManager(QtCore.QObject):
 
     def _show_history(self):
         from .recognition_history import RecognitionHistoryDialog
-        from recognition_store import DEFAULT_DATABASE
-        RecognitionHistoryDialog(DEFAULT_DATABASE, self.win).exec()
+        from recognition_store import database_url
+        RecognitionHistoryDialog(database_url(), self.win).exec()
+
+    def _open_database_settings(self):
+        from .database_settings import PostgreSQLSettingsDialog
+        PostgreSQLSettingsDialog(self.win).exec()
 
     def shutdown(self):
         if self.replay_page is not None:
@@ -200,7 +206,8 @@ class _StandaloneWindow(QtWidgets.QMainWindow):
 def main():
     app = QtWidgets.QApplication(sys.argv)
     win = _StandaloneWindow()
-    win.show()
+    # Keep normal window chrome while using the complete available desktop.
+    win.showMaximized()
     sys.exit(app.exec())
 
 

@@ -20,7 +20,7 @@ from signal_tracks import SignalTracker
 from ddc_rates import prepare_targets
 from dataclasses import replace
 from collections import OrderedDict
-from recognition_store import RecognitionStore, DEFAULT_DATABASE
+from recognition_store import RecognitionStore, DEFAULT_DATABASE, database_url
 from recognition_pipeline import PacketRecognitionPipeline
 from recognition_settings import remembered_checkpoint, remember_checkpoint
 from sigrec_model import discover_sigrec_checkpoint
@@ -132,6 +132,15 @@ class ReplayWorker:
             pass
         return self.cancel.is_set()
 
+    def _begin_next_frame(self):
+        """Discard every prior-frame target before analysing a new spectrum."""
+        self.tracker = SignalTracker()
+        self.previews.clear()
+        self._recognition_rows.clear()
+        self._recognition_status = ''
+        self._scheduled_ids = {}
+        self._active_batch = 0
+
     def _post_recognition(self, identifier, fields, status, preview=None):
         # Coalesce progress by ID; final results replace progress and are never
         # lost through the GUI's latest-frame mailbox. Only the producer owns tracks.
@@ -191,6 +200,9 @@ class ReplayWorker:
                 self._round_finished.set()
         except Exception as exc:
             self._recognition_error = str(exc)
+            # An error (especially database authentication) is not a
+            # completed round.  Keep the t0 frame frozen so we never resume
+            # refreshing with unprocessed spectrum data.
         finally:
             if store:
                 store.close()
@@ -348,6 +360,18 @@ class ReplayWorker:
             while not self.cancel.is_set():
                 if self.wait_pause():
                     break
+                # Freeze t0 until all collection and recognition work from
+                # that frame has completed.  This prevents later source data
+                # from replacing the spectrum/table while a round is active.
+                if self._round_busy:
+                    if state is not None:
+                        self.publish(state, observe=False)
+                    self.cancel.wait(.05)
+                    continue
+                if frame:
+                    # A new source frame is a fresh detection round; do not
+                    # carry stale rows or prior-frame IDs into its table.
+                    self._begin_next_frame()
                 tick = time.monotonic()
                 raw, start = reader.read()
                 power = spectrum_power(raw)
@@ -387,8 +411,10 @@ class ReplayWorker:
                                     f'{detected_count} 个候选 / {len(assignments)} 个符合条件 / 预划分{len(batches)}批 | '
                                     f'{len(rejected)} 路采样率不足 | {model_status}')
                 self.publish({**state, 'rows': [r.copy() for r in rows]})
-                if (recognizer and not self._round_busy and not self._recognition_error
-                        and batches and not self.cancel.is_set()):
+                # Only an actual recognition round holds the t0 spectrum.  No
+                # detected signal (or no loaded model) means there is no task
+                # to wait for, so the next source frame is read immediately.
+                if recognizer and batches and not self._round_busy and not self.cancel.is_set():
                     frozen = [[(t, self.tracker.identifier_for(t)) for t in batch]
                               for batch in batches]
                     self._round_busy = True
@@ -397,8 +423,9 @@ class ReplayWorker:
                     self._round_ids = tuple(self._scheduled_ids)
                     self._round_display_targets = tuple(detected_targets)
                     self._active_batch = 0
-                    self._jobs.put_nowait(dict(batches=frozen, start=start, frame=frame,
-                        cycle=reader.cycle, filter=frame_filter, multiplier=frame_multiplier))
+                    if not self._recognition_error:
+                        self._jobs.put_nowait(dict(batches=frozen, start=start, frame=frame,
+                            cycle=reader.cycle, filter=frame_filter, multiplier=frame_multiplier))
                     # 立即发布 t0 快照，替换刚才的实时检测帧，供 GUI 固定显示。
                     self.publish({**state, 'rows': [r.copy() for r in rows]}, observe=False)
                 # Every sample is visited; processing-speed playback, not 320 MSps realtime.
@@ -492,6 +519,7 @@ class FileReplayPage(QtWidgets.QWidget):
         self.model_button = QtWidgets.QPushButton('加载识别模型…')
         self.model_button.setToolTip('播放时也可选择模型；选中后结束当前处理，重新开始文件回放并加载模型')
         self.history_button = QtWidgets.QPushButton('识别记录…')
+        self.database_button = QtWidgets.QPushButton('数据库设置…')
         self.images_button = QtWidgets.QPushButton('查看时频图…')
         self.images_button.setToolTip('选择信号查看实际神经网络输入图像；没有模型时可从真实IQ单独生成预览')
         self.auto_adjust_button = QtWidgets.QPushButton('自动调整')
@@ -499,6 +527,7 @@ class FileReplayPage(QtWidgets.QWidget):
         for button in (self.open_button, self.play_button, self.pause_button, self.stop_button, self.model_button):
             bar.addWidget(button)
         bar.addWidget(self.history_button)
+        bar.addWidget(self.database_button)
         bar.addWidget(self.images_button)
         bar.addStretch()
         self.show_waterfall = QtWidgets.QCheckBox('显示瀑布图')
@@ -597,11 +626,12 @@ class FileReplayPage(QtWidgets.QWidget):
         self.curve = self.spectrum.plot(pen=pg.mkPen('#31d855', width=1))
         self._band_item = SpectrumBandsItem()
         self.spectrum.addItem(self._band_item, ignoreBounds=True)
+        self.spectrum.scene().sigMouseClicked.connect(self._spectrum_clicked)
         self.spectrum.setDownsampling(auto=True, mode='peak')
         self.waterfall = WaterfallPlot(history_rows=200, display_bins=2048)
         self.waterfall.setXLink(self.spectrum)
-        self.table = QtWidgets.QTableWidget(0, 12)
-        self.table.setHorizontalHeaderLabels(['中心频率 (MHz)', '检测带宽 (MHz)', '信号类别', '模型置信度', '通道类型', '轮询批次', 'IQ采样率 (MSps)', '4 MiB采集时长 (s)', '识别图像数', '多数票占比', '数据库记录', '检测状态'])
+        self.table = QtWidgets.QTableWidget(0, 13)
+        self.table.setHorizontalHeaderLabels(['信号编号', '中心频率 (MHz)', '检测带宽 (MHz)', '信号类别', '模型置信度', '通道类型', '轮询批次', 'IQ采样率 (MSps)', '4 MiB采集时长 (s)', '识别图像数', '多数票占比', '数据库记录', '检测状态'])
         self.table.verticalHeader().hide()
         self.table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.SingleSelection)
@@ -627,6 +657,7 @@ class FileReplayPage(QtWidgets.QWidget):
         self.open_button.clicked.connect(self.choose_file)
         self.model_button.clicked.connect(self.choose_model)
         self.history_button.clicked.connect(self.show_history)
+        self.database_button.clicked.connect(self.configure_database)
         self.images_button.clicked.connect(self.show_images)
         self.play_button.clicked.connect(self.start)
         self.stop_button.clicked.connect(self.stop)
@@ -725,8 +756,15 @@ class FileReplayPage(QtWidgets.QWidget):
 
     def show_history(self):
         from .recognition_history import RecognitionHistoryDialog
-        dialog = RecognitionHistoryDialog(DEFAULT_DATABASE, self)
+        dialog = RecognitionHistoryDialog(database_url(), self)
         dialog.exec()
+
+    def configure_database(self):
+        from .database_settings import PostgreSQLSettingsDialog
+        dialog = PostgreSQLSettingsDialog(self)
+        if dialog.exec() == QtWidgets.QDialog.DialogCode.Accepted:
+            self.database_path = database_url()
+            self.status.setText('PostgreSQL 设置已保存；下一次开始回放时使用新连接。')
 
     def show_images(self):
         row = self.table.currentRow()
@@ -764,6 +802,7 @@ class FileReplayPage(QtWidgets.QWidget):
             QtWidgets.QMessageBox.warning(self, '识别带宽无效', str(exc))
             return
         self._frame = None
+        self.database_path = database_url()
         self._last_state = None
         self._tracker = SignalTracker()
         self._table_last_update = 0.0
@@ -776,6 +815,8 @@ class FileReplayPage(QtWidgets.QWidget):
         self.table.setRowCount(0)
         self._clear_regions()
         self.waterfall.clear_history()
+        # The initial display is the configured effective detection bandwidth;
+        # bins outside it remain available to the source but are not shown.
         span = min(self.band.value()*1e6, self.info.sample_rate)
         low = self.center.value()*1e6 - span/2
         high = low + span
@@ -902,14 +943,14 @@ class FileReplayPage(QtWidgets.QWidget):
             for row, track in enumerate(tracks):
                 row_values = list(track.row)
                 row_values.extend(['—'] * (11-len(row_values)))
-                values = [*row_values,
+                values = [f'S{row+1:03d}', *row_values,
                           '当前检出' if not track.missed else f'暂未检出（{track.missed}帧）']
                 # kHz precision is readable without implying sub-bin accuracy.
-                values[0:2] = [f'{float(value):.3f}' for value in values[0:2]]
-                if values[5].isdigit():
-                    values[5] = f'第 {values[5]} 批'
+                values[1:3] = [f'{float(value):.3f}' for value in values[1:3]]
+                if values[6].isdigit():
+                    values[6] = f'第 {values[6]} 批'
                 if track.missed:
-                    values[5] = '暂未检出'
+                    values[6] = '暂未检出'
                 for col, value in enumerate(values):
                     item = self.table.item(row, col)
                     if item is None:
@@ -923,6 +964,27 @@ class FileReplayPage(QtWidgets.QWidget):
             self.table.verticalScrollBar().setValue(scroll)
         finally:
             self.table.setUpdatesEnabled(True)
+
+    def _spectrum_clicked(self, event):
+        """Select the table row for the narrowest marked band under a click."""
+        if event.button() != QtCore.Qt.MouseButton.LeftButton or self._last_state is None:
+            return
+        view = self.spectrum.getViewBox()
+        if not view.sceneBoundingRect().contains(event.scenePos()):
+            return
+        frequency = view.mapSceneToView(event.scenePos()).x()
+        tracks = self._tracker.visible(self.recognition_bandwidth.current)
+        candidates = [(track.target.bandwidth_hz, row)
+                      for row, track in enumerate(tracks)
+                      if abs(frequency - (self._last_state['center'] + track.target.center_hz))
+                      <= track.target.bandwidth_hz / 2]
+        if not candidates:
+            return
+        _, row = min(candidates)
+        self.table.selectRow(row)
+        item = self.table.item(row, 0)
+        if item is not None:
+            self.table.scrollToItem(item, QtWidgets.QAbstractItemView.ScrollHint.PositionAtCenter)
 
     def poll(self):
         worker = self.worker

@@ -570,7 +570,8 @@ class MainWindow(_StandaloneWindow):
 def main():
     app = QtWidgets.QApplication(sys.argv)
     win = MainWindow()
-    win.show()
+    # Windowed maximized mode: keep title bar, menu and desktop integration.
+    win.showMaximized()
     sys.exit(app.exec())
 
 

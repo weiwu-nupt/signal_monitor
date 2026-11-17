@@ -89,10 +89,11 @@ class ReplayPersistenceTests(unittest.TestCase):
             try:
                 page._last_state = state
                 page._render_targets(state, force_table=True)
-                self.assertEqual(page.table.item(0, 0).text(), '701.000')
-                self.assertEqual(page.table.item(0, 8).text(), '2')
-                self.assertEqual(page.table.item(0, 9).text(), '100.0%')
-                self.assertEqual(page.table.item(0, 10).text(), '1')
+                self.assertEqual(page.table.item(0, 0).text(), 'S001')
+                self.assertEqual(page.table.item(0, 1).text(), '701.000')
+                self.assertEqual(page.table.item(0, 9).text(), '2')
+                self.assertEqual(page.table.item(0, 10).text(), '100.0%')
+                self.assertEqual(page.table.item(0, 11).text(), '1')
                 self.assertEqual(history.table.item(0, 2).text(), 'S0001')
                 history.table.selectRow(0)
                 history.show_details()

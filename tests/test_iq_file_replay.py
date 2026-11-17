@@ -82,13 +82,13 @@ class FileTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             samples = np.zeros((6400, 2), dtype=np.int16)
             samples[:, 0] = 1000
-            packet = Path(directory) / 'iq_packets' / 'packet-1.npz'
-            packet.parent.mkdir()
-            np.savez_compressed(packet, iq=samples, sample_rate_hz=np.int64(320000))
+            class Store:
+                @staticmethod
+                def load_iq(_packet_id):
+                    return samples, 320000
             dialog = RecordedSpectrumDialog({
-                'center_hz': 700100000.0, 'bandwidth_hz': 100000,
-                'iq_path': 'iq_packets/packet-1.npz',
-            }, directory)
+                'id': 1, 'center_hz': 700100000.0, 'bandwidth_hz': 100000,
+            }, Store())
             try:
                 frequency, values = dialog.curve.getData()
                 self.assertEqual(len(frequency), len(values))

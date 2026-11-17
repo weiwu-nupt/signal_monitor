@@ -22,3 +22,5 @@ Thumbs.db
 results/*.sqlite3*
 results/recognition_settings.json
 results/recognition_settings.tmp
+results/postgresql.json
+results/postgresql.tmp
